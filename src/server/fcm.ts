@@ -1,149 +1,76 @@
-import { firestoreClient, projectId, databaseId, getChannelById, getAllUsersList, isChannelOpenPublic } from './db.ts';
+import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
-import crypto from 'crypto';
+import {
+  firestoreClient,
+  projectId,
+  databaseId,
+  getChannelById,
+  isChannelOpenPublic,
+  getAllUsersList,
+} from './db.ts';
+
+/**
+ * Firebase Cloud Messaging (FCM) Push Notification Service for Sami
+ * Uses shared Firestore collection `community_notifications` (type = 'fcm_device_token' for tokens
+ * and fcmStatus = 'pending' for push jobs) which is authorized across Web, Android, and Server.
+ */
 
 export interface DeviceTokenRecord {
   id: string;
   token: string;
   userId: number;
   username: string;
-  deviceId?: string;
-  platform?: string;
+  deviceId: string;
+  platform: string;
   deviceModel?: string;
-  createdAt: number;
   updatedAt: number;
+  createdAt: number;
 }
 
-const TOKENS_FILE = path.resolve('data/fcm_tokens.json');
-const NOTIFICATIONS_LOG_FILE = path.resolve('data/dispatched_notifications.json');
+const DATA_DIR = path.resolve('data');
+const TOKENS_FILE = path.join(DATA_DIR, 'fcm_tokens.json');
+const SHARED_NOTIF_COLLECTION = 'community_notifications';
 
-// Track recently sent (messageId -> Set<token>) to prevent duplicate notifications
-const sentMessageTokenMap = new Map<string, number>();
-const DEDUP_TTL_MS = 10 * 60 * 1000; // 10 minutes
-
-function pruneDedupCache(): void {
-  const cutoff = Date.now() - DEDUP_TTL_MS;
-  for (const [key, ts] of sentMessageTokenMap.entries()) {
-    if (ts < cutoff) {
-      sentMessageTokenMap.delete(key);
-    }
-  }
-}
-
-function getFirestoreBaseUrl(): string {
-  const dbSegment = encodeURIComponent(databaseId || '(default)');
-  return `https://firestore.googleapis.com/v1/projects/${encodeURIComponent(projectId)}/databases/${dbSegment}/documents`;
+if (!fs.existsSync(DATA_DIR)) {
+  fs.mkdirSync(DATA_DIR, { recursive: true });
 }
 
 function loadLocalTokens(): Record<string, DeviceTokenRecord> {
   try {
     if (fs.existsSync(TOKENS_FILE)) {
-      const data = fs.readFileSync(TOKENS_FILE, 'utf8');
-      return JSON.parse(data);
+      return JSON.parse(fs.readFileSync(TOKENS_FILE, 'utf8'));
     }
-  } catch (err) {
-    console.warn('[FCM Server] Warning reading fcm_tokens.json:', err);
-  }
+  } catch {}
   return {};
 }
 
-function saveLocalTokens(tokens: Record<string, DeviceTokenRecord>): void {
+function saveLocalTokens(store: Record<string, DeviceTokenRecord>): void {
   try {
-    const dir = path.dirname(TOKENS_FILE);
-    if (!fs.existsSync(dir)) {
-      fs.mkdirSync(dir, { recursive: true });
-    }
-    fs.writeFileSync(TOKENS_FILE, JSON.stringify(tokens, null, 2), 'utf8');
-  } catch (err) {
-    console.error('[FCM Server] Error saving fcm_tokens.json:', err);
+    fs.writeFileSync(TOKENS_FILE, JSON.stringify(store, null, 2), 'utf8');
+  } catch (e) {
+    console.warn('[FCM] Error saving local token store:', e);
   }
 }
 
-const memoryTokens = loadLocalTokens();
+const localTokens = loadLocalTokens();
 
-async function saveTokenToSharedFirestoreRest(record: DeviceTokenRecord): Promise<void> {
-  try {
-    const url = `${getFirestoreBaseUrl()}/user_fcm_tokens/${encodeURIComponent(record.id)}`;
-    await fetch(url, {
-      method: 'PATCH',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        fields: {
-          id: { stringValue: record.id },
-          token: { stringValue: record.token },
-          userId: { integerValue: String(record.userId) },
-          username: { stringValue: record.username || '' },
-          deviceId: { stringValue: record.deviceId || 'android_device' },
-          platform: { stringValue: record.platform || 'android' },
-          deviceModel: { stringValue: record.deviceModel || 'Android Device' },
-          createdAt: { integerValue: String(record.createdAt) },
-          updatedAt: { integerValue: String(record.updatedAt) },
-        },
-      }),
-    });
-  } catch {}
+function getFirestoreBaseUrl(): string {
+  const dbSeg = encodeURIComponent(databaseId || '(default)');
+  return `https://firestore.googleapis.com/v1/projects/${encodeURIComponent(projectId)}/databases/${dbSeg}/documents`;
 }
 
-async function deleteTokenFromSharedFirestoreRest(docId: string): Promise<void> {
-  try {
-    const url = `${getFirestoreBaseUrl()}/user_fcm_tokens/${encodeURIComponent(docId)}`;
-    await fetch(url, { method: 'DELETE' });
-  } catch {}
+function sanitizeDocIdPart(val: string): string {
+  return String(val || 'android').replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 64) || 'android';
 }
 
-async function querySharedFirestoreTokensForUsers(userIds: number[]): Promise<{ docId: string; token: string; userId: number }[]> {
-  const results: { docId: string; token: string; userId: number }[] = [];
-  if (userIds.length === 0) return results;
-
-  // Firestore IN operator supports up to 30 values per query
-  const chunks: number[][] = [];
-  for (let i = 0; i < userIds.length; i += 30) {
-    chunks.push(userIds.slice(i, i + 30));
-  }
-
-  for (const chunk of chunks) {
-    try {
-      const res = await fetch(`${getFirestoreBaseUrl()}:runQuery`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          structuredQuery: {
-            from: [{ collectionId: 'user_fcm_tokens' }],
-            where: {
-              fieldFilter: {
-                field: { fieldPath: 'userId' },
-                op: 'IN',
-                value: {
-                  arrayValue: {
-                    values: chunk.map((uid) => ({ integerValue: String(uid) })),
-                  },
-                },
-              },
-            },
-          },
-        }),
-      });
-      if (!res.ok) continue;
-      const rows: any[] = await res.json();
-      if (!Array.isArray(rows)) continue;
-      for (const row of rows) {
-        const doc = row?.document;
-        const f = doc?.fields;
-        if (!f) continue;
-        const token = f.token?.stringValue ? String(f.token.stringValue).trim() : '';
-        const uid = f.userId?.integerValue ? Number(f.userId.integerValue) : 0;
-        const docName = String(doc?.name || '');
-        const docId = f.id?.stringValue || docName.split('/').pop() || '';
-        if (token && uid > 0) {
-          results.push({ docId, token, userId: uid });
-        }
-      }
-    } catch {}
-  }
-
-  return results;
+function buildTokenDocId(userId: number, deviceId: string): string {
+  return `fcm_tok_${userId}_${sanitizeDocIdPart(deviceId)}`;
 }
+
+// ==========================================
+// 1. TOKEN REGISTRATION, REFRESH & CLEANUP
+// ==========================================
 
 export async function registerDeviceToken(params: {
   token: string;
@@ -153,138 +80,504 @@ export async function registerDeviceToken(params: {
   platform?: string;
   deviceModel?: string;
 }): Promise<DeviceTokenRecord> {
-  const { token, userId, username, deviceId, platform, deviceModel } = params;
-  const now = Date.now();
-  const safeToken = token.trim();
-  const cleanDeviceId = (deviceId || safeToken.substring(0, 20)).replace(/[^a-zA-Z0-9_-]/g, '_');
-  const docId = `token_${userId}_${cleanDeviceId}`;
+  const cleanToken = String(params.token || '').trim();
+  const userId = Number(params.userId);
+  if (!cleanToken || !userId || userId <= 0) {
+    throw new Error('بيانات تسجيل رمز الإشعارات غير صالحة');
+  }
 
-  // Clean up stale mappings if this exact FCM token or physical deviceId belonged to another session/token
-  for (const [existingKey, existingRec] of Object.entries(memoryTokens)) {
-    if (
-      existingKey !== docId &&
-      (existingRec.token === safeToken || (deviceId && existingRec.deviceId === deviceId))
-    ) {
-      delete memoryTokens[existingKey];
-      if (firestoreClient) {
-        firestoreClient.collection('user_fcm_tokens').doc(existingKey).delete().catch(() => {});
-      }
-      deleteTokenFromSharedFirestoreRest(existingKey).catch(() => {});
+  const deviceId = sanitizeDocIdPart(
+    params.deviceId?.trim() || crypto.createHash('sha1').update(cleanToken).digest('hex').slice(0, 16)
+  );
+  const now = Date.now();
+  const docId = buildTokenDocId(userId, deviceId);
+
+  // Clean up any stale bindings on the same physical device or same FCM token (account switch protection)
+  for (const [k, existing] of Object.entries(localTokens)) {
+    if (k !== docId && (existing.token === cleanToken || existing.deviceId === deviceId)) {
+      delete localTokens[k];
     }
   }
 
   const record: DeviceTokenRecord = {
     id: docId,
-    token: safeToken,
+    token: cleanToken,
     userId,
-    username,
-    deviceId: cleanDeviceId,
-    platform: platform || 'android',
-    deviceModel: deviceModel || 'Android Device',
-    createdAt: memoryTokens[docId]?.createdAt || now,
+    username: params.username || `user_${userId}`,
+    deviceId,
+    platform: params.platform || 'android',
+    deviceModel: params.deviceModel || 'Android',
     updatedAt: now,
+    createdAt: localTokens[docId]?.createdAt || now,
   };
 
-  memoryTokens[docId] = record;
-  saveLocalTokens(memoryTokens);
+  localTokens[docId] = record;
+  saveLocalTokens(localTokens);
+
+  // Clean stale bindings in shared Firestore community_notifications (type == 'fcm_device_token')
+  try {
+    const res = await fetch(`${getFirestoreBaseUrl()}:runQuery`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        structuredQuery: {
+          from: [{ collectionId: SHARED_NOTIF_COLLECTION }],
+          where: {
+            compositeFilter: {
+              op: 'AND',
+              filters: [
+                {
+                  fieldFilter: {
+                    field: { fieldPath: 'type' },
+                    op: 'EQUAL',
+                    value: { stringValue: 'fcm_device_token' },
+                  },
+                },
+                {
+                  fieldFilter: {
+                    field: { fieldPath: 'deviceId' },
+                    op: 'EQUAL',
+                    value: { stringValue: deviceId },
+                  },
+                },
+              ],
+            },
+          },
+          limit: 15,
+        },
+      }),
+    });
+    if (res.ok) {
+      const rows: any[] = await res.json();
+      for (const row of rows) {
+        const docName = row?.document?.name;
+        if (docName && !String(docName).endsWith(`/${docId}`)) {
+          await fetch(`https://firestore.googleapis.com/v1/${docName}`, { method: 'DELETE' }).catch(() => {});
+        }
+      }
+    }
+  } catch {}
 
   if (firestoreClient) {
     try {
-      await firestoreClient.collection('user_fcm_tokens').doc(docId).set(record, { merge: true });
-    } catch (err: any) {
-      console.warn('[FCM Server] Firestore token registration note:', err?.message);
-    }
+      await firestoreClient.collection(SHARED_NOTIF_COLLECTION).doc(docId).set(
+        {
+          ...record,
+          type: 'fcm_device_token',
+          title: 'fcm_token',
+          body: '',
+          senderId: userId,
+          senderName: record.username,
+          targetUserIds: [],
+          timestamp: now,
+        },
+        { merge: true }
+      );
+      return record;
+    } catch {}
   }
-  await saveTokenToSharedFirestoreRest(record);
+
+  try {
+    const url = `${getFirestoreBaseUrl()}/${SHARED_NOTIF_COLLECTION}/${encodeURIComponent(docId)}`;
+    await fetch(url, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        fields: {
+          id: { stringValue: record.id },
+          type: { stringValue: 'fcm_device_token' },
+          title: { stringValue: 'fcm_token' },
+          body: { stringValue: '' },
+          token: { stringValue: record.token },
+          userId: { integerValue: String(record.userId) },
+          senderId: { integerValue: String(record.userId) },
+          username: { stringValue: record.username },
+          senderName: { stringValue: record.username },
+          deviceId: { stringValue: record.deviceId },
+          platform: { stringValue: record.platform },
+          deviceModel: { stringValue: record.deviceModel || 'Android' },
+          targetUserIds: { arrayValue: { values: [] } },
+          timestamp: { integerValue: String(record.updatedAt) },
+          updatedAt: { integerValue: String(record.updatedAt) },
+          createdAt: { integerValue: String(record.createdAt) },
+        },
+      }),
+    });
+  } catch (err: any) {
+    console.warn('[FCM] Firestore REST token save notice:', err?.message);
+  }
 
   return record;
 }
 
 export async function unregisterDeviceToken(userId: number, token?: string, deviceId?: string): Promise<void> {
-  let changed = false;
-  for (const [key, record] of Object.entries(memoryTokens)) {
-    const matchesUser = record.userId === userId;
-    const matchesToken = !token || record.token === token;
-    const matchesDevice = !deviceId || record.deviceId === deviceId;
-    if (matchesUser && matchesToken && matchesDevice) {
-      delete memoryTokens[key];
-      changed = true;
-      if (firestoreClient) {
-        firestoreClient.collection('user_fcm_tokens').doc(key).delete().catch(() => {});
-      }
-      await deleteTokenFromSharedFirestoreRest(key);
+  const cleanTok = token?.trim();
+  const cleanDev = deviceId ? sanitizeDocIdPart(deviceId.trim()) : undefined;
+
+  for (const [k, rec] of Object.entries(localTokens)) {
+    const matchesUser = rec.userId === userId;
+    const matchesTok = cleanTok && rec.token === cleanTok;
+    const matchesDev = cleanDev && rec.deviceId === cleanDev;
+    if (matchesTok || (matchesUser && matchesDev) || (matchesUser && !cleanTok && !cleanDev)) {
+      delete localTokens[k];
     }
   }
+  saveLocalTokens(localTokens);
 
-  if (changed) {
-    saveLocalTokens(memoryTokens);
+  if (cleanDev && userId > 0) {
+    const docId = buildTokenDocId(userId, cleanDev);
+    await fetch(`${getFirestoreBaseUrl()}/${SHARED_NOTIF_COLLECTION}/${encodeURIComponent(docId)}`, {
+      method: 'DELETE',
+    }).catch(() => {});
   }
+
+  try {
+    const res = await fetch(`${getFirestoreBaseUrl()}:runQuery`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        structuredQuery: {
+          from: [{ collectionId: SHARED_NOTIF_COLLECTION }],
+          where: {
+            compositeFilter: {
+              op: 'AND',
+              filters: [
+                {
+                  fieldFilter: {
+                    field: { fieldPath: 'type' },
+                    op: 'EQUAL',
+                    value: { stringValue: 'fcm_device_token' },
+                  },
+                },
+                {
+                  fieldFilter: {
+                    field: { fieldPath: 'userId' },
+                    op: 'EQUAL',
+                    value: { integerValue: String(userId) },
+                  },
+                },
+              ],
+            },
+          },
+          limit: 25,
+        },
+      }),
+    });
+    if (res.ok) {
+      const rows: any[] = await res.json();
+      for (const row of rows) {
+        const doc = row?.document;
+        if (!doc?.name || !doc?.fields) continue;
+        const docTok = doc.fields.token?.stringValue || '';
+        const docDev = doc.fields.deviceId?.stringValue || '';
+        if (
+          (cleanTok && docTok === cleanTok) ||
+          (cleanDev && docDev === cleanDev) ||
+          (!cleanTok && !cleanDev)
+        ) {
+          await fetch(`https://firestore.googleapis.com/v1/${doc.name}`, { method: 'DELETE' }).catch(() => {});
+        }
+      }
+    }
+  } catch {}
 }
 
-async function pruneInvalidToken(badToken: string, docId?: string): Promise<void> {
-  let changed = false;
-  for (const [key, rec] of Object.entries(memoryTokens)) {
-    if (rec.token === badToken || (docId && key === docId)) {
-      delete memoryTokens[key];
-      changed = true;
-      if (firestoreClient) {
-        firestoreClient.collection('user_fcm_tokens').doc(key).delete().catch(() => {});
-      }
-      deleteTokenFromSharedFirestoreRest(key).catch(() => {});
+async function pruneInvalidToken(badToken: string): Promise<void> {
+  let modified = false;
+  for (const [k, rec] of Object.entries(localTokens)) {
+    if (rec.token === badToken) {
+      delete localTokens[k];
+      modified = true;
     }
   }
-  if (docId) {
-    deleteTokenFromSharedFirestoreRest(docId).catch(() => {});
-  }
-  if (changed) {
-    saveLocalTokens(memoryTokens);
-  }
+  if (modified) saveLocalTokens(localTokens);
+
+  try {
+    const res = await fetch(`${getFirestoreBaseUrl()}:runQuery`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        structuredQuery: {
+          from: [{ collectionId: SHARED_NOTIF_COLLECTION }],
+          where: {
+            compositeFilter: {
+              op: 'AND',
+              filters: [
+                {
+                  fieldFilter: {
+                    field: { fieldPath: 'type' },
+                    op: 'EQUAL',
+                    value: { stringValue: 'fcm_device_token' },
+                  },
+                },
+                {
+                  fieldFilter: {
+                    field: { fieldPath: 'token' },
+                    op: 'EQUAL',
+                    value: { stringValue: badToken },
+                  },
+                },
+              ],
+            },
+          },
+          limit: 20,
+        },
+      }),
+    });
+    if (res.ok) {
+      const rows: any[] = await res.json();
+      for (const row of rows) {
+        if (row?.document?.name) {
+          await fetch(`https://firestore.googleapis.com/v1/${row.document.name}`, { method: 'DELETE' }).catch(() => {});
+        }
+      }
+    }
+  } catch {}
 }
 
-export async function getTokensForUsers(userIds: number[]): Promise<{ token: string; userId: number; docId?: string }[]> {
-  const userTokens: { token: string; userId: number; docId?: string }[] = [];
-  const seen = new Set<string>();
+export async function getTokensForUsers(
+  userIds: number[],
+  excludeSenderId?: number
+): Promise<Array<{ token: string; userId: number }>> {
+  const allowedIds = Array.from(
+    new Set(userIds.filter((id) => id > 0 && id !== excludeSenderId))
+  );
+  if (allowedIds.length === 0) return [];
 
-  // 1. Search local memory/disk tokens
-  for (const record of Object.values(memoryTokens)) {
-    if (userIds.includes(record.userId) && record.token && !seen.has(record.token)) {
-      seen.add(record.token);
-      userTokens.push({ token: record.token, userId: record.userId, docId: record.id });
+  const tokenToUser = new Map<string, number>();
+
+  for (const rec of Object.values(localTokens)) {
+    if (allowedIds.includes(rec.userId) && rec.token) {
+      tokenToUser.set(rec.token, rec.userId);
     }
   }
 
-  // 2. Search Firestore Admin SDK tokens if initialized
-  if (firestoreClient) {
+  try {
+    const res = await fetch(`${getFirestoreBaseUrl()}:runQuery`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        structuredQuery: {
+          from: [{ collectionId: SHARED_NOTIF_COLLECTION }],
+          where: {
+            fieldFilter: {
+              field: { fieldPath: 'type' },
+              op: 'EQUAL',
+              value: { stringValue: 'fcm_device_token' },
+            },
+          },
+          limit: 400,
+        },
+      }),
+    });
+    if (res.ok) {
+      const rows: any[] = await res.json();
+      for (const row of rows) {
+        const f = row?.document?.fields;
+        if (!f) continue;
+        const uid = Number(f.userId?.integerValue || 0);
+        const tok = String(f.token?.stringValue || '').trim();
+        if (tok && allowedIds.includes(uid) && uid !== excludeSenderId) {
+          tokenToUser.set(tok, uid);
+        }
+      }
+    }
+  } catch {}
+
+  return Array.from(tokenToUser.entries()).map(([token, userId]) => ({ token, userId }));
+}
+
+// ==========================================
+// 2. OAUTH2 / CREDENTIAL VALIDATION FOR FCM HTTP v1 API
+// ==========================================
+
+let cachedAccessToken: string | null = null;
+let cachedTokenExpiry = 0;
+let cachedMetadataProjectId: string | null | undefined = undefined;
+let loggedMissingCredsWarning = false;
+
+function parseValidServiceAccountJson(): { client_email: string; private_key: string; project_id: string } | null {
+  const saRaw = (process.env.FIREBASE_SERVICE_ACCOUNT_KEY || process.env.GCP_SERVICE_ACCOUNT_KEY || '').trim();
+  if (!saRaw || saRaw.length < 120) return null;
+  try {
+    const jsonStr = saRaw.startsWith('{') ? saRaw : Buffer.from(saRaw, 'base64').toString('utf8');
+    if (!jsonStr.trim().startsWith('{')) return null;
+    const creds = JSON.parse(jsonStr);
+    if (
+      creds?.type === 'service_account' &&
+      typeof creds.client_email === 'string' &&
+      typeof creds.private_key === 'string' &&
+      creds.private_key.includes('BEGIN PRIVATE KEY')
+    ) {
+      return {
+        client_email: creds.client_email,
+        private_key: creds.private_key,
+        project_id: String(creds.project_id || projectId),
+      };
+    }
+  } catch {}
+  return null;
+}
+
+function getValidLegacyServerKey(): string | null {
+  const raw = (process.env.FCM_SERVER_KEY || process.env.FIREBASE_SERVER_KEY || '').trim();
+  if (!raw || raw.length < 80) return null;
+  if (raw.startsWith('ai-studio-') || raw.endsWith('-media') || raw.includes(' ')) return null;
+  return raw;
+}
+
+export function hasServerFcmCredentials(): { configured: boolean; mode: string; reason?: string } {
+  const sa = parseValidServiceAccountJson();
+  if (sa) {
+    if (sa.project_id && sa.project_id !== projectId) {
+      return {
+        configured: false,
+        mode: 'project_mismatch',
+        reason: `Service account belongs to "${sa.project_id}" instead of "${projectId}"`,
+      };
+    }
+    return { configured: true, mode: 'service_account_v1' };
+  }
+  if (cachedMetadataProjectId === projectId) {
+    return { configured: true, mode: 'gce_metadata_adc_v1' };
+  }
+  const legacy = getValidLegacyServerKey();
+  if (legacy) {
+    return { configured: true, mode: 'legacy_server_key' };
+  }
+  return {
+    configured: false,
+    mode: 'missing_credentials',
+    reason: `FIREBASE_SERVICE_ACCOUNT_KEY (JSON for project "${projectId}") is not configured on the server`,
+  };
+}
+
+function base64UrlEncode(input: Buffer | string): string {
+  const buf = typeof input === 'string' ? Buffer.from(input, 'utf8') : input;
+  return buf.toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
+}
+
+async function getGoogleOAuth2AccessToken(): Promise<string | null> {
+  const now = Date.now();
+  if (cachedAccessToken && now < cachedTokenExpiry - 60_000) {
+    return cachedAccessToken;
+  }
+
+  // 1. Service Account JSON (FIREBASE_SERVICE_ACCOUNT_KEY or GCP_SERVICE_ACCOUNT_KEY)
+  const creds = parseValidServiceAccountJson();
+  if (creds && (!creds.project_id || creds.project_id === projectId)) {
     try {
-      for (const uid of userIds) {
-        const snap = await firestoreClient
-          .collection('user_fcm_tokens')
-          .where('userId', '==', uid)
-          .get();
-        snap.forEach((doc: any) => {
-          const data = doc.data() as DeviceTokenRecord;
-          if (data.token && !seen.has(data.token)) {
-            seen.add(data.token);
-            userTokens.push({ token: data.token, userId: data.userId, docId: doc.id });
-          }
-        });
-      }
-    } catch {}
-  }
+      const iat = Math.floor(now / 1000);
+      const exp = iat + 3600;
+      const header = base64UrlEncode(JSON.stringify({ alg: 'RS256', typ: 'JWT' }));
+      const claimSet = base64UrlEncode(
+        JSON.stringify({
+          iss: creds.client_email,
+          scope: 'https://www.googleapis.com/auth/firebase.messaging',
+          aud: 'https://oauth2.googleapis.com/token',
+          iat,
+          exp,
+        })
+      );
+      const signer = crypto.createSign('RSA-SHA256');
+      signer.update(`${header}.${claimSet}`);
+      signer.end();
+      const signature = base64UrlEncode(signer.sign(creds.private_key));
+      const assertion = `${header}.${claimSet}.${signature}`;
 
-  // 3. Search shared Cloud Firestore via REST query (ensures Android WebView & Web tokens are always found)
-  const restTokens = await querySharedFirestoreTokensForUsers(userIds);
-  for (const rt of restTokens) {
-    if (rt.token && !seen.has(rt.token)) {
-      seen.add(rt.token);
-      userTokens.push(rt);
+      const tokenRes = await fetch('https://oauth2.googleapis.com/token', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({
+          grant_type: 'urn:ietf:params:oauth:grant-type:jwt-bearer',
+          assertion,
+        }).toString(),
+      });
+
+      if (tokenRes.ok) {
+        const tokenData: any = await tokenRes.json();
+        if (tokenData.access_token) {
+          cachedAccessToken = tokenData.access_token;
+          cachedTokenExpiry = now + (Number(tokenData.expires_in) || 3500) * 1000;
+          return cachedAccessToken;
+        }
+      } else {
+        const errBody = await tokenRes.text().catch(() => '');
+        console.warn('[FCM] Service Account OAuth2 token exchange failed:', tokenRes.status, errBody.slice(0, 180));
+      }
+    } catch (e: any) {
+      console.warn('[FCM] Service Account JWT signing failed:', e?.message);
     }
   }
 
-  return userTokens;
+  // 2. GCE / Cloud Run Metadata Server ADC — ONLY if running inside the matching Firebase GCP project!
+  try {
+    if (cachedMetadataProjectId === undefined) {
+      const ctrlProj = new AbortController();
+      const tProj = setTimeout(() => ctrlProj.abort(), 1500);
+      const projRes = await fetch('http://metadata.google.internal/computeMetadata/v1/project/project-id', {
+        headers: { 'Metadata-Flavor': 'Google' },
+        signal: ctrlProj.signal,
+      });
+      clearTimeout(tProj);
+      cachedMetadataProjectId = projRes.ok ? (await projRes.text()).trim() : null;
+    }
+
+    if (cachedMetadataProjectId === projectId) {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 1800);
+      const metaRes = await fetch(
+        'http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token',
+        {
+          headers: { 'Metadata-Flavor': 'Google' },
+          signal: controller.signal,
+        }
+      );
+      clearTimeout(timeout);
+      if (metaRes.ok) {
+        const metaData: any = await metaRes.json();
+        if (metaData.access_token) {
+          cachedAccessToken = metaData.access_token;
+          cachedTokenExpiry = now + (Number(metaData.expires_in) || 1800) * 1000;
+          return cachedAccessToken;
+        }
+      }
+    }
+  } catch {
+    cachedMetadataProjectId = null;
+  }
+
+  if (!loggedMissingCredsWarning) {
+    loggedMissingCredsWarning = true;
+    console.warn(
+      `[FCM] Server FCM HTTP v1 credentials are not configured for Firebase project "${projectId}". ` +
+        `Set FIREBASE_SERVICE_ACCOUNT_KEY to a valid Service Account JSON from "${projectId}" to enable killed-app FCM pushes.`
+    );
+  }
+
+  return null;
 }
 
-export interface NotificationPayload {
+// ==========================================
+// 3. DEDUPLICATION & ACTUAL PUSH SENDING
+// ==========================================
+
+const recentSentPushKeys = new Map<string, number>();
+
+function isAlreadySentRecently(dedupKey: string): boolean {
+  const now = Date.now();
+  if (recentSentPushKeys.size > 500) {
+    for (const [k, ts] of recentSentPushKeys.entries()) {
+      if (now - ts > 120_000) recentSentPushKeys.delete(k);
+    }
+  }
+  const prev = recentSentPushKeys.get(dedupKey);
+  if (prev && now - prev < 60_000) return true;
+  recentSentPushKeys.set(dedupKey, now);
+  return false;
+}
+
+export interface ChatPushPayload {
   title: string;
   body: string;
   chatType: 'channel' | 'private';
@@ -295,294 +588,127 @@ export interface NotificationPayload {
   senderId?: number;
 }
 
-let cachedAccessToken: { token: string; expiresAt: number } | null = null;
+async function sendSingleFcmV1(
+  accessToken: string,
+  targetToken: string,
+  recipientUserId: number,
+  payload: ChatPushPayload
+): Promise<{ ok: boolean; invalidToken?: boolean; error?: string }> {
+  const url = `https://fcm.googleapis.com/v1/projects/${encodeURIComponent(projectId)}/messages:send`;
+  const channelIdAndroid = payload.chatType === 'private' ? 'sami_private_messages_v2' : 'sami_channel_messages_v2';
+  const tagKey = payload.messageId || `${payload.chatType}_${payload.channelId || payload.partnerId || 'msg'}`;
 
-/**
- * Generate Google OAuth2 access token for FCM HTTP v1 using Service Account credentials or GCE Metadata Server
- */
-async function getGoogleOAuth2AccessToken(): Promise<string | null> {
-  if (cachedAccessToken && cachedAccessToken.expiresAt > Date.now() + 60_000) {
-    return cachedAccessToken.token;
+  const dataMap: Record<string, string> = {
+    title: payload.title,
+    body: payload.body,
+    chatType: payload.chatType,
+    channelId: payload.channelId || '',
+    partnerId: payload.partnerId ? String(payload.partnerId) : '',
+    recipientUserId: String(recipientUserId),
+    messageId: payload.messageId || '',
+    senderName: payload.senderName || 'Sami',
+    senderId: payload.senderId ? String(payload.senderId) : '',
+  };
+
+  // Send BOTH notification + data with high priority so Android OS wakes app when killed/swiped
+  // AND delivers to SamiFirebaseMessagingService in foreground.
+  // For private messages, redact lockscreen notification body if sensitive while keeping full data payload for authorized unlocked session.
+  const osNotificationBody =
+    payload.chatType === 'private' ? 'لديك رسالة خاصة جديدة — افتح التطبيق لعرضها' : payload.body;
+
+  const messageBody = {
+    message: {
+      token: targetToken,
+      notification: {
+        title: payload.title,
+        body: osNotificationBody,
+      },
+      data: dataMap,
+      android: {
+        priority: 'HIGH',
+        ttl: '86400s',
+        collapse_key: tagKey.slice(0, 64),
+        notification: {
+          channel_id: channelIdAndroid,
+          sound: 'default',
+          default_vibrate_timings: true,
+          notification_priority: 'PRIORITY_HIGH',
+          visibility: payload.chatType === 'private' ? 'PRIVATE' : 'PUBLIC',
+          tag: tagKey.slice(0, 64),
+          click_action: 'OPEN_SAMI_CHAT',
+        },
+      },
+    },
+  };
+
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify(messageBody),
+  });
+
+  if (res.ok) {
+    return { ok: true };
   }
 
-  // 1. Try Service Account Key from server environment
-  try {
-    const rawKey = process.env.GCP_SERVICE_ACCOUNT_KEY || process.env.FIREBASE_SERVICE_ACCOUNT_KEY;
-    if (rawKey) {
-      const jsonStr = rawKey.trim().startsWith('{')
-        ? rawKey.trim()
-        : Buffer.from(rawKey.trim(), 'base64').toString('utf8');
-      const sa = JSON.parse(jsonStr);
+  const errText = await res.text().catch(() => '');
+  const isInvalid =
+    res.status === 404 ||
+    errText.includes('UNREGISTERED') ||
+    errText.includes('INVALID_ARGUMENT') ||
+    errText.includes('registration-token-not-registered');
 
-      if (sa.client_email && sa.private_key) {
-        const now = Math.floor(Date.now() / 1000);
-        const header = Buffer.from(JSON.stringify({ alg: 'RS256', typ: 'JWT' })).toString('base64url');
-        const claimSet = Buffer.from(
-          JSON.stringify({
-            iss: sa.client_email,
-            scope: 'https://www.googleapis.com/auth/firebase.messaging',
-            aud: 'https://oauth2.googleapis.com/token',
-            exp: now + 3600,
-            iat: now,
-          })
-        ).toString('base64url');
-
-        const signer = crypto.createSign('RSA-SHA256');
-        signer.update(`${header}.${claimSet}`);
-        const signature = signer.sign(sa.private_key, 'base64url');
-        const assertion = `${header}.${claimSet}.${signature}`;
-
-        const tokenRes = await fetch('https://oauth2.googleapis.com/token', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-          body: new URLSearchParams({
-            grant_type: 'urn:ietf:params:oauth:grant-type:jwt-bearer',
-            assertion,
-          }),
-        });
-
-        if (tokenRes.ok) {
-          const data = (await tokenRes.json()) as any;
-          if (data.access_token) {
-            cachedAccessToken = {
-              token: data.access_token,
-              expiresAt: Date.now() + ((Number(data.expires_in) || 3500) - 60) * 1000,
-            };
-            return data.access_token;
-          }
-        }
-      }
-    }
-  } catch (err: any) {
-    console.warn('[FCM Server] Notice on Service Account OAuth2 token generation:', err?.message);
-  }
-
-  // 2. Try Google Cloud Run / GCE Metadata Server ADC (zero secrets needed on Cloud Run!)
-  try {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 1500);
-    const metaRes = await fetch(
-      'http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token',
-      {
-        headers: { 'Metadata-Flavor': 'Google' },
-        signal: controller.signal,
-      }
-    );
-    clearTimeout(timer);
-    if (metaRes.ok) {
-      const metaJson = (await metaRes.json()) as any;
-      if (metaJson?.access_token) {
-        cachedAccessToken = {
-          token: metaJson.access_token,
-          expiresAt: Date.now() + ((Number(metaJson.expires_in) || 1800) - 60) * 1000,
-        };
-        return metaJson.access_token;
-      }
-    }
-  } catch {}
-
-  return null;
+  return { ok: false, invalidToken: isInvalid, error: `${res.status}: ${errText.slice(0, 180)}` };
 }
 
 export async function sendNotificationToUsers(
-  recipientUserIds: number[],
-  payload: NotificationPayload
-): Promise<{ sentCount: number; failedCount: number; skippedDuplicates?: number }> {
-  pruneDedupCache();
-
-  // Strictly exclude sender
-  const filteredUserIds = Array.from(new Set(recipientUserIds.filter((id) => id > 0 && id !== payload.senderId)));
-  if (filteredUserIds.length === 0) {
-    return { sentCount: 0, failedCount: 0 };
+  targetUserIds: number[],
+  payload: ChatPushPayload
+): Promise<{ sentCount: number; failedCount: number; credentialsConfigured: boolean }> {
+  const recipients = await getTokensForUsers(targetUserIds, payload.senderId);
+  if (recipients.length === 0) {
+    return { sentCount: 0, failedCount: 0, credentialsConfigured: hasServerFcmCredentials().configured };
   }
 
-  const userTokens = await getTokensForUsers(filteredUserIds);
-  if (userTokens.length === 0) {
-    return { sentCount: 0, failedCount: 0 };
+  const accessToken = await getGoogleOAuth2AccessToken();
+  if (!accessToken) {
+    return { sentCount: 0, failedCount: recipients.length, credentialsConfigured: false };
   }
 
   let sentCount = 0;
   let failedCount = 0;
-  let skippedDuplicates = 0;
 
-  const oauthToken = await getGoogleOAuth2AccessToken();
-  const serverKey = process.env.FCM_SERVER_KEY || process.env.FIREBASE_SERVER_KEY;
-  const collapseTag = payload.messageId || `sami_${payload.chatType}_${payload.channelId || payload.partnerId || 'msg'}`;
-  const androidChannelId = payload.chatType === 'private' ? 'sami_private_messages' : 'sami_channel_messages';
-
-  for (const { token, userId, docId } of userTokens) {
-    const dedupKey = payload.messageId ? `${payload.messageId}::${token}` : '';
-    if (dedupKey && sentMessageTokenMap.has(dedupKey)) {
-      skippedDuplicates++;
-      continue;
-    }
-
-    let sent = false;
-
-    const dataMap: Record<string, string> = {
-      title: payload.title,
-      body: payload.body,
-      chatType: payload.chatType,
-      channelId: payload.channelId || '',
-      partnerId: payload.partnerId ? String(payload.partnerId) : '',
-      messageId: payload.messageId || '',
-      senderName: payload.senderName || '',
-      senderId: payload.senderId ? String(payload.senderId) : '',
-      recipientId: String(userId),
-    };
-
-    // 1. FCM HTTP v1 API
-    if (oauthToken) {
-      try {
-        const v1Url = `https://fcm.googleapis.com/v1/projects/${projectId}/messages:send`;
-        const v1Body = {
-          message: {
-            token,
-            notification: {
-              title: payload.title,
-              body: payload.body,
-            },
-            android: {
-              priority: 'HIGH',
-              collapse_key: collapseTag.slice(0, 64),
-              notification: {
-                channel_id: androidChannelId,
-                title: payload.title,
-                body: payload.body,
-                sound: 'default',
-                tag: collapseTag.slice(0, 64),
-                notification_priority: 'PRIORITY_HIGH',
-                visibility: payload.chatType === 'private' ? 'PRIVATE' : 'PUBLIC',
-                color: '#F59E0B',
-                click_action: 'OPEN_SAMI_CHAT',
-              },
-            },
-            webpush: {
-              headers: { Urgency: 'high' },
-              notification: {
-                title: payload.title,
-                body: payload.body,
-                icon: '/icon-192.png',
-                badge: '/favicon.png',
-                tag: collapseTag,
-                renotify: true,
-              },
-              fcm_options: {
-                link: '/',
-              },
-            },
-            data: dataMap,
-          },
-        };
-
-        const res = await fetch(v1Url, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            Authorization: `Bearer ${oauthToken}`,
-          },
-          body: JSON.stringify(v1Body),
-        });
-
-        if (res.ok) {
-          sent = true;
-          sentCount++;
-          if (dedupKey) sentMessageTokenMap.set(dedupKey, Date.now());
-        } else {
-          const errText = await res.text().catch(() => '');
-          if (
-            res.status === 404 ||
-            errText.includes('UNREGISTERED') ||
-            errText.includes('registration-token-not-registered')
-          ) {
-            await pruneInvalidToken(token, docId);
-          }
-          if (!serverKey) {
-            failedCount++;
-          }
-        }
-      } catch (err: any) {
-        console.warn(`[FCM Server] HTTP v1 send error for user ${userId}:`, err?.message);
-        if (!serverKey) failedCount++;
+  await Promise.allSettled(
+    recipients.map(async ({ token, userId }) => {
+      const dedupKey = `${payload.messageId || `${payload.title}_${payload.body}`}::${token}`;
+      if (payload.messageId && isAlreadySentRecently(dedupKey)) {
+        return;
       }
-    }
 
-    // 2. Legacy FCM HTTP API fallback if configured
-    if (!sent && serverKey) {
-      try {
-        const legacyRes = await fetch('https://fcm.googleapis.com/fcm/send', {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            Authorization: `key=${serverKey}`,
-          },
-          body: JSON.stringify({
-            to: token,
-            priority: 'high',
-            collapse_key: collapseTag.slice(0, 64),
-            notification: {
-              title: payload.title,
-              body: payload.body,
-              sound: 'default',
-              tag: collapseTag.slice(0, 64),
-              android_channel_id: androidChannelId,
-            },
-            data: dataMap,
-          }),
-        });
-
-        const legacyJson: any = await legacyRes.json().catch(() => null);
-        if (legacyRes.ok && (!legacyJson || Number(legacyJson.success) > 0)) {
-          sent = true;
-          sentCount++;
-          if (dedupKey) sentMessageTokenMap.set(dedupKey, Date.now());
-        } else {
-          const errCode = legacyJson?.results?.[0]?.error || '';
-          if (errCode === 'NotRegistered' || errCode === 'InvalidRegistration') {
-            await pruneInvalidToken(token, docId);
-          }
-          failedCount++;
-        }
-      } catch {
+      const result = await sendSingleFcmV1(accessToken, token, userId, payload);
+      if (result.ok) {
+        sentCount++;
+      } else {
         failedCount++;
+        if (result.invalidToken) {
+          await pruneInvalidToken(token);
+        } else if (result.error) {
+          console.warn('[FCM] Push delivery error:', result.error);
+        }
       }
-    }
+    })
+  );
 
-    if (!sent && !oauthToken && !serverKey) {
-      failedCount++;
-    }
-  }
-
-  // Record dispatched notification in local audit log
-  try {
-    let logs: any[] = [];
-    if (fs.existsSync(NOTIFICATIONS_LOG_FILE)) {
-      logs = JSON.parse(fs.readFileSync(NOTIFICATIONS_LOG_FILE, 'utf8'));
-    }
-    logs.push({
-      timestamp: Date.now(),
-      messageId: payload.messageId || null,
-      chatType: payload.chatType,
-      recipientCount: userTokens.length,
-      sentCount,
-      failedCount,
-      skippedDuplicates,
-      credentialsAvailable: Boolean(oauthToken || serverKey),
-    });
-    if (logs.length > 100) logs = logs.slice(-100);
-    const dir = path.dirname(NOTIFICATIONS_LOG_FILE);
-    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-    fs.writeFileSync(NOTIFICATIONS_LOG_FILE, JSON.stringify(logs, null, 2), 'utf8');
-  } catch {}
-
-  return { sentCount, failedCount, skippedDuplicates };
+  return { sentCount, failedCount, credentialsConfigured: true };
 }
 
-/**
- * Privacy-enforced push dispatcher used after a message is persisted to the shared DB.
- * Ensures private chats only notify the exact recipient and hidden/protected channels
- * only notify authorized members without leaking content.
- */
+// ==========================================
+// 4. AUTHORIZED MESSAGE PUSH DISPATCHER
+// ==========================================
+
 export async function dispatchAuthorizedChatPush(params: {
   senderId: number;
   senderName: string;
@@ -590,17 +716,16 @@ export async function dispatchAuthorizedChatPush(params: {
   chatType: 'channel' | 'private';
   channelId?: string;
   receiverId?: number;
-  messageId?: string;
-  snippet?: string;
-}): Promise<{ sentCount: number; failedCount: number }> {
+  messageId: string;
+  snippet: string;
+}): Promise<{ sentCount: number; failedCount: number; credentialsConfigured: boolean }> {
   const { senderId, senderName, senderRole, chatType, channelId, receiverId, messageId, snippet } = params;
 
   if (chatType === 'private') {
     if (!receiverId || receiverId <= 0 || receiverId === senderId) {
-      return { sentCount: 0, failedCount: 0 };
+      return { sentCount: 0, failedCount: 0, credentialsConfigured: hasServerFcmCredentials().configured };
     }
     const title = senderId === 1 ? '👑 رسالة خاصة من القائد Sami' : `💬 رسالة خاصة من ${senderName}`;
-    // Keep body generic or safe for lockscreen privacy (Android channel also uses VISIBILITY_PRIVATE)
     const body = snippet && snippet.trim() ? snippet.trim().slice(0, 100) : 'لديك رسالة خاصة جديدة';
     return sendNotificationToUsers([receiverId], {
       title,
@@ -614,30 +739,29 @@ export async function dispatchAuthorizedChatPush(params: {
   }
 
   if (!channelId) {
-    return { sentCount: 0, failedCount: 0 };
+    return { sentCount: 0, failedCount: 0, credentialsConfigured: hasServerFcmCredentials().configured };
   }
 
   const channel = await getChannelById(channelId);
   if (!channel) {
-    return { sentCount: 0, failedCount: 0 };
+    return { sentCount: 0, failedCount: 0, credentialsConfigured: hasServerFcmCredentials().configured };
   }
 
-  // Enforce sender access check
   const openPublic = isChannelOpenPublic(channel);
   const authorizedMembers = Array.from(
     new Set([...(channel.allowedMemberIds || []), ...(channel.memberIds || []), 1])
   ).filter((id) => id > 0);
 
   if (!openPublic && senderRole !== 'owner' && senderId !== 1 && !authorizedMembers.includes(senderId)) {
-    return { sentCount: 0, failedCount: 0 };
+    return { sentCount: 0, failedCount: 0, credentialsConfigured: hasServerFcmCredentials().configured };
   }
 
   let recipientIds: number[] = [];
   if (channel.visibility === 'hidden' || !openPublic) {
-    // Strictly send ONLY to authorized members of hidden / password-protected / private channels!
+    // Strictly send ONLY to authorized members of hidden / password-protected / private channels
     recipientIds = authorizedMembers;
   } else {
-    // Open public channel: send to all registered users + joined members
+    // Open public channel: send to registered users + joined members
     const allUsers = await getAllUsersList();
     recipientIds = Array.from(new Set([...allUsers.map((u) => u.id), ...authorizedMembers]));
   }
@@ -660,21 +784,47 @@ export async function dispatchAuthorizedChatPush(params: {
   });
 }
 
-// Background outbox worker for Android APK / direct-Firestore message dispatches
+// ==========================================
+// 5. BACKGROUND OUTBOX WORKER (POLLS community_notifications WHERE fcmStatus == 'pending')
+// ==========================================
+
 let outboxPollingActive = false;
+
+async function updateOutboxDocStatus(docName: string, status: string): Promise<void> {
+  await fetch(
+    `https://firestore.googleapis.com/v1/${docName}?updateMask.fieldPaths=fcmStatus&updateMask.fieldPaths=fcmProcessedAt`,
+    {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        fields: {
+          fcmStatus: { stringValue: status },
+          fcmProcessedAt: { integerValue: String(Date.now()) },
+        },
+      }),
+    }
+  ).catch(() => {});
+}
+
 async function pollPendingFcmOutbox(): Promise<void> {
   if (outboxPollingActive) return;
   outboxPollingActive = true;
   try {
+    // Trigger ADC check once on first poll so hasServerFcmCredentials() knows if GCE ADC matches projectId
+    const accessToken = await getGoogleOAuth2AccessToken();
+    if (!accessToken) {
+      return;
+    }
+
     const res = await fetch(`${getFirestoreBaseUrl()}:runQuery`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         structuredQuery: {
-          from: [{ collectionId: 'fcm_outbox' }],
+          from: [{ collectionId: SHARED_NOTIF_COLLECTION }],
           where: {
             fieldFilter: {
-              field: { fieldPath: 'status' },
+              field: { fieldPath: 'fcmStatus' },
               op: 'EQUAL',
               value: { stringValue: 'pending' },
             },
@@ -693,23 +843,23 @@ async function pollPendingFcmOutbox(): Promise<void> {
       const f = doc?.fields;
       if (!doc?.name || !f) continue;
 
+      const notifType = f.type?.stringValue || '';
+      if (notifType === 'fcm_device_token') continue;
+
       const jobId = f.id?.stringValue || String(doc.name).split('/').pop() || '';
-      const createdAt = Number(f.createdAt?.integerValue || 0);
-      // Skip stale jobs older than 15 minutes and mark expired
+      const createdAt = Number(f.timestamp?.integerValue || f.createdAt?.integerValue || 0);
       if (createdAt > 0 && now - createdAt > 15 * 60 * 1000) {
-        await fetch(`https://firestore.googleapis.com/v1/${doc.name}?updateMask.fieldPaths=status`, {
-          method: 'PATCH',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ fields: { status: { stringValue: 'expired' } } }),
-        }).catch(() => {});
+        await updateOutboxDocStatus(doc.name, 'expired');
         continue;
       }
 
       const senderId = Number(f.senderId?.integerValue || 0);
       const senderName = String(f.senderName?.stringValue || 'Sami');
-      const chatType = f.chatType?.stringValue === 'private' ? 'private' : 'channel';
+      const senderRole = String(f.senderRole?.stringValue || (senderId === 1 ? 'owner' : 'user'));
+      const chatType =
+        f.chatType?.stringValue === 'private' || notifType === 'private_message' ? 'private' : 'channel';
       const channelId = f.channelId?.stringValue || undefined;
-      const partnerId = Number(f.partnerId?.integerValue || 0);
+      const partnerId = Number(f.partnerId?.integerValue || f.privateChatWithUserId?.integerValue || 0);
       const messageId = f.messageId?.stringValue || jobId;
       const bodyText = String(f.body?.stringValue || 'رسالة جديدة');
       const targetUserIds: number[] = Array.isArray(f.targetUserIds?.arrayValue?.values)
@@ -720,28 +870,26 @@ async function pollPendingFcmOutbox(): Promise<void> {
 
       const receiverId = chatType === 'private' ? targetUserIds[0] : undefined;
 
-      // Mark processing/processed first so multiple ticks don't re-send
-      await fetch(`https://firestore.googleapis.com/v1/${doc.name}?updateMask.fieldPaths=status&updateMask.fieldPaths=processedAt`, {
-        method: 'PATCH',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          fields: {
-            status: { stringValue: 'dispatched' },
-            processedAt: { integerValue: String(Date.now()) },
-          },
-        }),
-      }).catch(() => {});
+      await updateOutboxDocStatus(doc.name, 'processing');
 
-      await dispatchAuthorizedChatPush({
+      const dispatchRes = await dispatchAuthorizedChatPush({
         senderId,
         senderName,
-        senderRole: senderId === 1 ? 'owner' : 'user',
+        senderRole,
         chatType,
         channelId,
         receiverId: receiverId || (partnerId && partnerId !== senderId ? partnerId : undefined),
         messageId,
         snippet: bodyText,
       });
+
+      const finalStatus =
+        dispatchRes.sentCount > 0
+          ? 'sent'
+          : dispatchRes.failedCount > 0
+            ? 'failed'
+            : 'no_registered_devices';
+      await updateOutboxDocStatus(doc.name, finalStatus);
     }
   } catch {
     // Ignore transient network errors
@@ -752,4 +900,4 @@ async function pollPendingFcmOutbox(): Promise<void> {
 
 setInterval(() => {
   pollPendingFcmOutbox().catch(() => {});
-}, 6000);
+}, 5000);

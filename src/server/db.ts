@@ -358,6 +358,57 @@ export async function getAllUsersList(): Promise<Omit<UserRecord, 'passwordHash'
     }
   }
 
+  // Fallback: also read shared Firestore community_users via REST so server push/RBAC sees cloud accounts
+  try {
+    const dbSeg = encodeURIComponent(databaseId || '(default)');
+    const runQueryUrl = `https://firestore.googleapis.com/v1/projects/${encodeURIComponent(projectId)}/databases/${dbSeg}/documents:runQuery`;
+    const res = await fetch(runQueryUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        structuredQuery: {
+          from: [{ collectionId: 'community_users' }],
+          limit: 300,
+        },
+      }),
+    });
+    if (res.ok) {
+      const rows: any[] = await res.json();
+      if (Array.isArray(rows)) {
+        for (const row of rows) {
+          const doc = row?.document;
+          const f = doc?.fields;
+          if (!doc?.name || !f) continue;
+          const docId = String(doc.name).split('/').pop() || '';
+          const uid = Number(f.id?.integerValue || docId || 0);
+          if (!uid || uid <= 0 || uid >= 9000000) continue;
+          const key = String(uid);
+          if (!results[key]) {
+            const rawRole = String(f.role?.stringValue || 'user');
+            const role: UserRecord['role'] =
+              uid === 1
+                ? 'owner'
+                : rawRole === 'moderator'
+                  ? 'moderator'
+                  : rawRole === 'guest'
+                    ? 'guest'
+                    : 'user';
+            results[key] = {
+              id: uid,
+              username: String(f.username?.stringValue || `user_${uid}`),
+              displayName: String(f.displayName?.stringValue || f.username?.stringValue || `مستخدم ${uid}`),
+              role,
+              avatarUrl: f.avatarUrl?.stringValue || null,
+              warningsCount: Number(f.warningsCount?.integerValue || 0),
+              createdAt: Number(f.createdAt?.integerValue || Date.now()),
+              updatedAt: Number(f.updatedAt?.integerValue || Date.now()),
+            };
+          }
+        }
+      }
+    }
+  } catch {}
+
   return Object.values(results);
 }
 

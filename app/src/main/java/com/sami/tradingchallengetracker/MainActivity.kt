@@ -67,8 +67,10 @@ import com.sami.tradingchallengetracker.util.Money
 import kotlinx.coroutines.delay
 import java.util.Locale
 
+import android.media.MediaRecorder
 import android.os.Build
 import android.provider.Settings
+import android.util.Base64
 import android.webkit.JavascriptInterface
 import androidx.core.app.NotificationManagerCompat
 import com.google.firebase.messaging.FirebaseMessaging
@@ -76,6 +78,8 @@ import com.sami.tradingchallengetracker.util.SamiFirebaseMessagingService
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import org.json.JSONObject
+import java.io.File
 
 class MainActivity : ComponentActivity() {
 
@@ -131,6 +135,107 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    private var nativeVoiceRecorder: MediaRecorder? = null
+    private var nativeVoiceFile: File? = null
+    private var nativeVoiceStartMs: Long = 0L
+
+    @Synchronized
+    fun startNativeVoiceRecInternal(): String {
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+            requestAudioPermissionInternal(null)
+            return JSONObject().put("ok", false).put("reason", "permission_required").toString()
+        }
+        cancelNativeVoiceRecInternal()
+        return try {
+            val outFile = File(cacheDir, "sami_voice_${System.currentTimeMillis()}.m4a")
+            val recorder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                MediaRecorder(this)
+            } else {
+                @Suppress("DEPRECATION")
+                MediaRecorder()
+            }
+            recorder.setAudioSource(MediaRecorder.AudioSource.MIC)
+            recorder.setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
+            recorder.setAudioEncoder(MediaRecorder.AudioEncoder.AAC)
+            recorder.setAudioChannels(1)
+            recorder.setAudioSamplingRate(44100)
+            recorder.setAudioEncodingBitRate(64000)
+            recorder.setOutputFile(outFile.absolutePath)
+            recorder.prepare()
+            recorder.start()
+            nativeVoiceRecorder = recorder
+            nativeVoiceFile = outFile
+            nativeVoiceStartMs = System.currentTimeMillis()
+            JSONObject().put("ok", true).put("mimeType", "audio/mp4").toString()
+        } catch (e: Exception) {
+            android.util.Log.w("SamiAudio", "Native MediaRecorder start failed: ${e.message}")
+            cancelNativeVoiceRecInternal()
+            JSONObject().put("ok", false).put("reason", e.message ?: "recorder_error").toString()
+        }
+    }
+
+    @Synchronized
+    fun stopNativeVoiceRecInternal(): String {
+        val recorder = nativeVoiceRecorder
+        val outFile = nativeVoiceFile
+        val elapsedSec = ((System.currentTimeMillis() - nativeVoiceStartMs) / 1000L).toInt().coerceAtLeast(1)
+        nativeVoiceRecorder = null
+        nativeVoiceFile = null
+        nativeVoiceStartMs = 0L
+
+        if (recorder == null || outFile == null) {
+            return JSONObject().put("ok", false).put("reason", "not_recording").toString()
+        }
+
+        try {
+            recorder.stop()
+        } catch (e: Exception) {
+            android.util.Log.w("SamiAudio", "Native MediaRecorder stop warning: ${e.message}")
+        } finally {
+            try {
+                recorder.release()
+            } catch (_: Exception) {}
+        }
+
+        return try {
+            if (!outFile.exists() || outFile.length() <= 100L) {
+                outFile.delete()
+                JSONObject().put("ok", false).put("reason", "empty_audio").toString()
+            } else {
+                val bytes = outFile.readBytes()
+                outFile.delete()
+                val b64 = Base64.encodeToString(bytes, Base64.NO_WRAP)
+                JSONObject()
+                    .put("ok", true)
+                    .put("mimeType", "audio/mp4")
+                    .put("ext", "m4a")
+                    .put("size", bytes.size)
+                    .put("duration", elapsedSec)
+                    .put("base64", b64)
+                    .toString()
+            }
+        } catch (e: Exception) {
+            try { outFile.delete() } catch (_: Exception) {}
+            JSONObject().put("ok", false).put("reason", e.message ?: "read_failed").toString()
+        }
+    }
+
+    @Synchronized
+    fun cancelNativeVoiceRecInternal() {
+        val recorder = nativeVoiceRecorder
+        val outFile = nativeVoiceFile
+        nativeVoiceRecorder = null
+        nativeVoiceFile = null
+        nativeVoiceStartMs = 0L
+        if (recorder != null) {
+            try { recorder.stop() } catch (_: Exception) {}
+            try { recorder.release() } catch (_: Exception) {}
+        }
+        if (outFile != null) {
+            try { outFile.delete() } catch (_: Exception) {}
+        }
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
@@ -140,16 +245,26 @@ class MainActivity : ComponentActivity() {
         // 1. Initialize notification channels
         SamiFirebaseMessagingService.createNotificationChannels(this)
 
-        // 2. Request notification permission on Android 13+ if not yet granted
+        // 2. Request notification permission on Android 13+ ONCE automatically (do not nag every launch if denied)
         if (Build.VERSION.SDK_INT >= 33) {
-            if (ContextCompat.checkSelfPermission(
+            val fcmPrefs = getSharedPreferences(SamiFirebaseMessagingService.PREFS_NAME, Context.MODE_PRIVATE)
+            val alreadyPrompted = fcmPrefs.getBoolean(SamiFirebaseMessagingService.KEY_HAS_PROMPTED_NOTIF_PERM, false)
+            if (!alreadyPrompted && ContextCompat.checkSelfPermission(
                     this,
                     Manifest.permission.POST_NOTIFICATIONS
                 ) != PackageManager.PERMISSION_GRANTED
             ) {
+                fcmPrefs.edit().putBoolean(SamiFirebaseMessagingService.KEY_HAS_PROMPTED_NOTIF_PERM, true).apply()
                 notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
             }
         }
+
+        // Start authorized real-time notification listener if user session is already active
+        val savedUid = SamiFirebaseMessagingService.getCurrentUserId(this)
+        if (savedUid > 0) {
+            FirebaseCloudHelper.startNotificationPushListener(applicationContext, savedUid)
+        }
+
         initFcmToken()
 
         // 3. Process incoming notification deep link from launch intent
@@ -181,6 +296,35 @@ class MainActivity : ComponentActivity() {
                 }
             }
         }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        SamiFirebaseMessagingService.setForegroundState(true)
+        val uid = SamiFirebaseMessagingService.getCurrentUserId(this)
+        if (uid > 0) {
+            FirebaseCloudHelper.startNotificationPushListener(applicationContext, uid)
+        }
+        activeWebView?.let { wv ->
+            val granted = NotificationManagerCompat.from(this).areNotificationsEnabled()
+            wv.post {
+                wv.evaluateJavascript(
+                    "if (typeof window !== 'undefined') { window.__samiNativeNotifPerm = ${if (granted) "'granted'" else "'denied'"}; window.dispatchEvent(new Event('sami_native_perm_update')); }",
+                    null
+                )
+            }
+        }
+    }
+
+    override fun onPause() {
+        super.onPause()
+        SamiFirebaseMessagingService.setForegroundState(false)
+    }
+
+    override fun onDestroy() {
+        cancelNativeVoiceRecInternal()
+        SamiFirebaseMessagingService.setForegroundState(false)
+        super.onDestroy()
     }
 
     override fun onNewIntent(intent: Intent) {
@@ -443,6 +587,57 @@ class SamiAndroidBridge(
     }
 
     @JavascriptInterface
+    fun setActiveChatContext(chatType: String, channelId: String, partnerIdStr: String) {
+        val pId = partnerIdStr.trim().toIntOrNull()
+        SamiFirebaseMessagingService.setActiveConversation(
+            chatType.trim().ifEmpty { null },
+            channelId.trim().ifEmpty { null },
+            pId
+        )
+    }
+
+    @JavascriptInterface
+    fun showNativeNotification(
+        title: String,
+        body: String,
+        chatType: String,
+        channelId: String,
+        partnerIdStr: String,
+        messageId: String,
+        senderIdStr: String,
+        senderName: String
+    ) {
+        val partnerId = partnerIdStr.trim().toIntOrNull()
+        val senderId = senderIdStr.trim().toIntOrNull()
+        SamiFirebaseMessagingService.postAuthorizedSystemNotification(
+            context = activity.applicationContext,
+            title = title,
+            body = body,
+            chatType = chatType.ifBlank { "channel" },
+            channelId = channelId,
+            partnerId = partnerId,
+            messageId = messageId,
+            senderId = senderId,
+            senderName = senderName
+        )
+    }
+
+    @JavascriptInterface
+    fun startNativeVoiceRecording(): String {
+        return activity.startNativeVoiceRecInternal()
+    }
+
+    @JavascriptInterface
+    fun stopNativeVoiceRecording(): String {
+        return activity.stopNativeVoiceRecInternal()
+    }
+
+    @JavascriptInterface
+    fun cancelNativeVoiceRecording() {
+        activity.cancelNativeVoiceRecInternal()
+    }
+
+    @JavascriptInterface
     fun onLogout() {
         val prevUid = SamiFirebaseMessagingService.getCurrentUserId(activity)
         SamiFirebaseMessagingService.clearCurrentSession(activity)
@@ -519,12 +714,17 @@ fun FullAppWebView(
                             request: WebResourceRequest
                         ): WebResourceResponse? {
                             val url = request.url
-                            val host = url.host ?: ""
-                            if (host == "appassets.androidplatform.net" || host == "localhost" || host.isEmpty()) {
-                                val localResp = loadAssetFile(ctx, url.path ?: "")
+                            val scheme = url.scheme?.lowercase(Locale.ROOT) ?: ""
+                            // Never intercept blob:, data:, mediastream:, file:, or content: URLs (required for audio/media!)
+                            if (scheme != "http" && scheme != "https") {
+                                return null
+                            }
+                            val host = url.host?.lowercase(Locale.ROOT) ?: ""
+                            if (host == "appassets.androidplatform.net" || host == "localhost") {
+                                val localResp = loadAssetFile(ctx, url.path ?: "", request.isForMainFrame)
                                 if (localResp != null) return localResp
                             }
-                            return assetLoader.shouldInterceptRequest(request.url)
+                            return assetLoader.shouldInterceptRequest(url)
                         }
 
                         override fun onPageFinished(view: WebView?, url: String?) {
@@ -649,8 +849,14 @@ private fun getMimeType(filePath: String): String {
         lower.endsWith(".svg") -> "image/svg+xml"
         lower.endsWith(".webp") -> "image/webp"
         lower.endsWith(".ico") -> "image/x-icon"
+        lower.endsWith(".m4a") -> "audio/mp4"
+        lower.endsWith(".mp3") -> "audio/mpeg"
+        lower.endsWith(".aac") -> "audio/aac"
+        lower.endsWith(".ogg") || lower.endsWith(".oga") || lower.endsWith(".opus") -> "audio/ogg"
+        lower.endsWith(".wav") -> "audio/wav"
+        lower.endsWith(".weba") -> "audio/webm"
         lower.endsWith(".mp4") -> "video/mp4"
-        lower.endsWith(".webm") -> "video/webm"
+        lower.endsWith(".webm") -> if (lower.contains("voice") || lower.contains("audio")) "audio/webm" else "video/webm"
         lower.endsWith(".woff2") -> "font/woff2"
         lower.endsWith(".woff") -> "font/woff"
         lower.endsWith(".ttf") -> "font/ttf"
@@ -660,15 +866,18 @@ private fun getMimeType(filePath: String): String {
     }
 }
 
-private fun loadAssetFile(context: Context, rawPath: String): WebResourceResponse? {
+private fun loadAssetFile(context: Context, rawPath: String, isForMainFrame: Boolean = false): WebResourceResponse? {
     try {
         var cleanPath = rawPath.trimStart('/')
         if (
             cleanPath.isEmpty() ||
-            cleanPath == "assets" ||
-            cleanPath == "assets/" ||
-            cleanPath.contains("fix-center") ||
-            cleanPath == "sami.html"
+            cleanPath == "index.html" ||
+            (isForMainFrame && (
+                cleanPath == "assets" ||
+                cleanPath == "assets/" ||
+                cleanPath.contains("fix-center") ||
+                cleanPath == "sami.html"
+            ))
         ) {
             cleanPath = "index.html"
         }

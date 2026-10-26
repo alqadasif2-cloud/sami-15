@@ -37,6 +37,7 @@ import {
   unregisterDeviceToken,
   sendNotificationToUsers,
   dispatchAuthorizedChatPush,
+  hasServerFcmCredentials,
 } from './fcm.ts';
 
 export const apiRouter = Router();
@@ -78,6 +79,7 @@ apiRouter.get('/database/status', async (req, res) => {
     auth: {
       jwtMode: process.env.JWT_SECRET ? 'Environment Configured' : 'Ephemeral Secure Generated',
     },
+    fcm: hasServerFcmCredentials(),
     serverUptimeSeconds: Math.floor(process.uptime()),
   });
 });
@@ -502,10 +504,16 @@ apiRouter.post('/channels/:id/messages', requireAuth, async (req, res) => {
       }
     }
 
-    const { text, fileUrl, fileName, fileSize, fileType, audioUrl, audioDuration, replyToId } = req.body;
+    const { text, fileUrl, fileName, fileSize, fileType, audioUrl, audioDuration, storagePath, replyToId } = req.body;
 
     if (!text && !fileUrl && !audioUrl) {
       return res.status(400).json({ error: 'محتوى الرسالة مطلوب' });
+    }
+
+    const isLocalPath = (u: unknown) =>
+      typeof u === 'string' && /^(blob:|file:|content:|filesystem:)/i.test(u.trim());
+    if (isLocalPath(audioUrl) || isLocalPath(fileUrl)) {
+      return res.status(400).json({ error: 'لا يمكن حفظ مسار صوتي محلي غير مرفوع إلى السحابة' });
     }
 
     const now = Date.now();
@@ -525,6 +533,7 @@ apiRouter.post('/channels/:id/messages', requireAuth, async (req, res) => {
       fileName: fileName || undefined,
       fileSize: fileSize || undefined,
       fileType: fileType || undefined,
+      storagePath: storagePath || undefined,
       audioUrl: audioUrl || undefined,
       audioDuration: audioDuration ? Number(audioDuration) : undefined,
       replyToId: replyToId || null,
@@ -880,6 +889,12 @@ apiRouter.post('/private-messages', requireAuth, async (req, res) => {
     return res.status(400).json({ error: 'محتوى الرسالة مطلوب' });
   }
 
+  const isLocalPrivatePath = (u: unknown) =>
+    typeof u === 'string' && /^(blob:|file:|content:|filesystem:)/i.test(u.trim());
+  if (isLocalPrivatePath(audioUrl) || isLocalPrivatePath(fileUrl) || isLocalPrivatePath(imageUrl)) {
+    return res.status(400).json({ error: 'لا يمكن حفظ مسار ملف أو تسجيل صوتي محلي غير مرفوع إلى السحابة' });
+  }
+
   const now = Date.now();
   const newMsg = {
     id: `pm_${now}_${senderId}_${Math.random().toString(36).substring(2, 7)}`,
@@ -1037,8 +1052,12 @@ apiRouter.post('/fcm/dispatch', requireAuth, async (req, res) => {
     const chatType = req.body.chatType === 'private' ? 'private' : 'channel';
     const channelId = req.body.channelId ? String(req.body.channelId) : undefined;
     const receiverId = req.body.receiverId ? Number(req.body.receiverId) : undefined;
-    const messageId = req.body.messageId ? String(req.body.messageId) : undefined;
-    const snippet = req.body.body ? String(req.body.body) : undefined;
+    const messageId = req.body.messageId ? String(req.body.messageId) : `msg_${Date.now()}`;
+    const snippet = req.body.body
+      ? String(req.body.body)
+      : req.body.snippet
+        ? String(req.body.snippet)
+        : 'رسالة جديدة';
 
     const result = await dispatchAuthorizedChatPush({
       senderId: user.id,

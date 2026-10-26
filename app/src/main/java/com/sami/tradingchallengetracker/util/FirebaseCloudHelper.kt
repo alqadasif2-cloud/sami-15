@@ -1,352 +1,420 @@
 package com.sami.tradingchallengetracker.util
 
-import android.content.ContentValues
 import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.net.Uri
 import android.os.Build
-import android.os.Environment
-import android.provider.MediaStore
-import androidx.core.content.FileProvider
+import android.provider.Settings
+import android.util.Log
 import com.google.firebase.FirebaseApp
 import com.google.firebase.FirebaseOptions
+import com.google.firebase.firestore.DocumentChange
 import com.google.firebase.firestore.FirebaseFirestore
-import com.google.firebase.firestore.FirebaseFirestoreSettings
-import com.google.firebase.firestore.PersistentCacheSettings
+import com.google.firebase.firestore.ListenerRegistration
+import com.google.firebase.firestore.Query
+import com.google.firebase.firestore.SetOptions
 import com.google.firebase.storage.FirebaseStorage
-import com.sami.tradingchallengetracker.data.ChallengeEntity
-import com.sami.tradingchallengetracker.data.TradeEntity
-import com.sami.tradingchallengetracker.data.TradeType
-import kotlinx.coroutines.Dispatchers
+import com.google.firebase.storage.StorageMetadata
 import kotlinx.coroutines.tasks.await
-import kotlinx.coroutines.withContext
-import java.io.File
-import java.io.FileOutputStream
-import java.net.URL
+import java.io.ByteArrayOutputStream
 import java.util.UUID
 
+/**
+ * Shared Firebase Cloud Helper for Android App
+ * Connects to shared Firestore database (`ai-studio-c1d1b606-9578-42a6-b7b2-17faaec47f72`)
+ * and shared Storage bucket (`majestic-interface-ksmzh.firebasestorage.app`).
+ */
 object FirebaseCloudHelper {
 
-    @Volatile
-    private var firestoreInstance: FirebaseFirestore? = null
-
-    @Volatile
-    private var storageInstance: FirebaseStorage? = null
-
+    private const val TAG = "FirebaseCloudHelper"
     private const val SHARED_FIREBASE_PROJECT_ID = "majestic-interface-ksmzh"
-    private const val SHARED_FIREBASE_APP_ID = "1:462035009117:web:ef127abfd25d8ff2ec17b4"
-    private const val SHARED_FIREBASE_API_KEY = "AIzaSyCWSCiM0EVatqiBL5wUO8ZAfKcJHqud9dU"
-    private const val SHARED_FIREBASE_SENDER_ID = "462035009117"
     private const val SHARED_FIREBASE_STORAGE_BUCKET = "majestic-interface-ksmzh.firebasestorage.app"
     private const val SHARED_FIRESTORE_DB_ID = "ai-studio-c1d1b606-9578-42a6-b7b2-17faaec47f72"
-    private const val FCM_PREFS = "sami_fcm_prefs"
-    private const val KEY_STABLE_DEVICE_ID = "key_stable_device_id"
+    private const val SHARED_FIREBASE_API_KEY = "AIzaSyCWSCiM0EVatqiBL5wUO8ZAfKcJHqud9dU"
+    private const val SHARED_FIREBASE_APP_ID = "1:462035009117:web:ef127abfd25d8ff2ec17b4"
+    private const val SHARED_FIREBASE_SENDER_ID = "462035009117"
 
-    fun ensureInitialized(context: Context): FirebaseApp? {
-        val appCtx = context.applicationContext ?: context
+    // Authorized shared Firestore collection for notifications & device push tokens
+    const val COLLECTION_NOTIFICATIONS = "community_notifications"
+    const val COLLECTION_CHANNELS = "community_channels"
+
+    @Volatile
+    private var notificationListenerReg: ListenerRegistration? = null
+
+    @Volatile
+    private var listeningForUserId: Int = 0
+
+    @Synchronized
+    fun ensureInitialized(context: Context): Boolean {
         return try {
+            val appCtx = context.applicationContext
             if (FirebaseApp.getApps(appCtx).isNotEmpty()) {
-                FirebaseApp.getInstance()
-            } else {
-                FirebaseApp.initializeApp(appCtx) ?: run {
-                    val options = FirebaseOptions.Builder()
-                        .setProjectId(SHARED_FIREBASE_PROJECT_ID)
-                        .setApplicationId(SHARED_FIREBASE_APP_ID)
-                        .setApiKey(SHARED_FIREBASE_API_KEY)
-                        .setGcmSenderId(SHARED_FIREBASE_SENDER_ID)
-                        .setStorageBucket(SHARED_FIREBASE_STORAGE_BUCKET)
-                        .build()
-                    FirebaseApp.initializeApp(appCtx, options)
-                }
+                return true
             }
-        } catch (_: Exception) {
+            val defaultApp = FirebaseApp.initializeApp(appCtx)
+            if (defaultApp != null) {
+                return true
+            }
+            val options = FirebaseOptions.Builder()
+                .setProjectId(SHARED_FIREBASE_PROJECT_ID)
+                .setApplicationId(SHARED_FIREBASE_APP_ID)
+                .setApiKey(SHARED_FIREBASE_API_KEY)
+                .setGcmSenderId(SHARED_FIREBASE_SENDER_ID)
+                .setStorageBucket(SHARED_FIREBASE_STORAGE_BUCKET)
+                .build()
+            FirebaseApp.initializeApp(appCtx, options)
+            Log.d(TAG, "Initialized FirebaseApp explicitly with shared Sami configuration.")
+            true
+        } catch (e: Exception) {
+            Log.w(TAG, "Firebase initialization check notice: ${e.message}")
+            FirebaseApp.getApps(context.applicationContext).isNotEmpty()
+        }
+    }
+
+    fun isFirebaseConfigured(context: Context): Boolean {
+        return ensureInitialized(context)
+    }
+
+    fun getFirestore(context: Context): FirebaseFirestore? {
+        if (!ensureInitialized(context)) return null
+        return try {
+            val app = FirebaseApp.getInstance()
+            FirebaseFirestore.getInstance(app, SHARED_FIRESTORE_DB_ID)
+        } catch (e: Exception) {
+            Log.w(TAG, "Named Firestore fallback to default: ${e.message}")
             try {
-                FirebaseApp.getInstance()
-            } catch (_: Exception) {
+                FirebaseFirestore.getInstance()
+            } catch (ex: Exception) {
+                Log.e(TAG, "Firestore unavailable", ex)
                 null
             }
         }
     }
 
-    fun getStableDeviceId(context: Context): String {
-        val prefs = context.getSharedPreferences(FCM_PREFS, Context.MODE_PRIVATE)
-        val existing = prefs.getString(KEY_STABLE_DEVICE_ID, null)
-        if (!existing.isNullOrBlank()) return existing
-        val generated = "dev_android_${UUID.randomUUID().toString().replace("-", "").take(16)}"
-        prefs.edit().putString(KEY_STABLE_DEVICE_ID, generated).apply()
-        return generated
-    }
-
-    fun getFirestore(context: Context): FirebaseFirestore {
-        return firestoreInstance ?: synchronized(this) {
-            firestoreInstance ?: run {
-                val app = ensureInitialized(context)
-
-                val db = try {
-                    if (app != null) {
-                        FirebaseFirestore.getInstance(app, SHARED_FIRESTORE_DB_ID)
-                    } else {
-                        FirebaseFirestore.getInstance(SHARED_FIRESTORE_DB_ID)
-                    }
-                } catch (_: Exception) {
-                    if (app != null) {
-                        FirebaseFirestore.getInstance(app)
-                    } else {
-                        FirebaseFirestore.getInstance()
-                    }
-                }
-
-                try {
-                    val settings = FirebaseFirestoreSettings.Builder()
-                        .setLocalCacheSettings(
-                            PersistentCacheSettings.newBuilder()
-                                .setSizeBytes(100L * 1024 * 1024) // 100MB offline local cache
-                                .build()
-                        )
-                        .build()
-                    db.firestoreSettings = settings
-                } catch (_: Exception) {}
-
-                firestoreInstance = db
-                db
+    fun getStorage(context: Context): FirebaseStorage? {
+        if (!ensureInitialized(context)) return null
+        return try {
+            FirebaseStorage.getInstance("gs://$SHARED_FIREBASE_STORAGE_BUCKET")
+        } catch (e: Exception) {
+            try {
+                FirebaseStorage.getInstance()
+            } catch (ex: Exception) {
+                Log.e(TAG, "Firebase Storage unavailable", ex)
+                null
             }
         }
     }
 
+    /**
+     * Generates or retrieves a persistent unique device identifier for multi-device FCM support
+     */
+    fun getStableDeviceId(context: Context): String {
+        val prefs = context.getSharedPreferences(SamiFirebaseMessagingService.PREFS_NAME, Context.MODE_PRIVATE)
+        val cached = prefs.getString("stable_device_id", null)
+        if (!cached.isNullOrBlank()) return cached
+
+        val androidId = try {
+            Settings.Secure.getString(context.contentResolver, Settings.Secure.ANDROID_ID)
+        } catch (_: Exception) {
+            null
+        }
+        val rawGenerated = if (!androidId.isNullOrBlank() && androidId != "9774d56d682e549c") {
+            "and_$androidId"
+        } else {
+            "and_${UUID.randomUUID().toString().replace("-", "").take(16)}"
+        }
+        val cleanId = rawGenerated.replace(Regex("[^a-zA-Z0-9_-]"), "_").take(64)
+        prefs.edit().putString("stable_device_id", cleanId).apply()
+        return cleanId
+    }
+
+    private fun buildTokenDocId(userId: Int, deviceId: String): String {
+        val safeDev = deviceId.replace(Regex("[^a-zA-Z0-9_-]"), "_").take(64).ifEmpty { "android" }
+        return "fcm_tok_${userId}_$safeDev"
+    }
+
+    /**
+     * Registers or refreshes the device's FCM token in the authorized shared Firestore
+     * collection (`community_notifications/fcm_tok_{userId}_{deviceId}`), unbinding any
+     * stale account previously signed in on the same physical device.
+     */
     suspend fun syncDeviceFcmToken(
         context: Context,
         token: String,
         userId: Int,
         username: String
-    ) = withContext(Dispatchers.IO) {
+    ): Boolean {
         val cleanToken = token.trim()
-        if (cleanToken.isEmpty() || userId <= 0) return@withContext
-        try {
-            val db = getFirestore(context)
-            val devId = getStableDeviceId(context)
-            val docId = "token_${userId}_${devId}"
-            val now = System.currentTimeMillis()
+        if (cleanToken.isEmpty() || userId <= 0) return false
+        val db = getFirestore(context) ?: return false
+        val deviceId = getStableDeviceId(context)
+        val docId = buildTokenDocId(userId, deviceId)
+        val now = System.currentTimeMillis()
+        val model = "${Build.MANUFACTURER} ${Build.MODEL}".trim()
 
-            // Remove any stale token document on this same physical device from a previous user account
-            val prefs = context.getSharedPreferences(FCM_PREFS, Context.MODE_PRIVATE)
-            val lastBoundUserId = prefs.getInt("key_last_bound_uid", 0)
-            if (lastBoundUserId > 0 && lastBoundUserId != userId) {
-                try {
-                    db.collection("user_fcm_tokens").document("token_${lastBoundUserId}_${devId}").delete().await()
-                } catch (_: Exception) {}
-            }
-            prefs.edit().putInt("key_last_bound_uid", userId).apply()
+        return try {
+            // Unbind any previous user account associated with this same deviceId or token
+            try {
+                val sameDeviceDocs = db.collection(COLLECTION_NOTIFICATIONS)
+                    .whereEqualTo("type", "fcm_device_token")
+                    .whereEqualTo("deviceId", deviceId)
+                    .get()
+                    .await()
+                for (doc in sameDeviceDocs.documents) {
+                    if (doc.id != docId) {
+                        doc.reference.delete().await()
+                    }
+                }
+            } catch (_: Exception) {}
+
+            try {
+                val sameTokenDocs = db.collection(COLLECTION_NOTIFICATIONS)
+                    .whereEqualTo("type", "fcm_device_token")
+                    .whereEqualTo("token", cleanToken)
+                    .get()
+                    .await()
+                for (doc in sameTokenDocs.documents) {
+                    if (doc.id != docId) {
+                        doc.reference.delete().await()
+                    }
+                }
+            } catch (_: Exception) {}
 
             val payload = hashMapOf<String, Any>(
                 "id" to docId,
+                "type" to "fcm_device_token",
+                "title" to "fcm_token",
+                "body" to "",
                 "token" to cleanToken,
                 "userId" to userId,
+                "senderId" to userId,
                 "username" to username,
-                "deviceId" to devId,
+                "senderName" to username,
+                "deviceId" to deviceId,
                 "platform" to "android",
-                "deviceModel" to "${Build.MANUFACTURER} ${Build.MODEL}".trim(),
+                "deviceModel" to model,
+                "targetUserIds" to emptyList<Int>(),
+                "timestamp" to now,
                 "updatedAt" to now,
                 "createdAt" to now
             )
 
-            db.collection("user_fcm_tokens").document(docId).set(payload).await()
+            db.collection(COLLECTION_NOTIFICATIONS)
+                .document(docId)
+                .set(payload, SetOptions.merge())
+                .await()
+
+            Log.d(TAG, "Synced FCM token to shared Firestore for user=$userId device=$deviceId")
+            true
         } catch (e: Exception) {
-            android.util.Log.w("SamiFCM", "Error syncing FCM token to shared Firestore: ${e.message}")
+            Log.w(TAG, "Failed to sync FCM token to Firestore: ${e.message}")
+            false
         }
     }
 
-    suspend fun removeDeviceFcmToken(context: Context, userId: Int) = withContext(Dispatchers.IO) {
-        if (userId <= 0) return@withContext
-        try {
-            val db = getFirestore(context)
-            val devId = getStableDeviceId(context)
-            db.collection("user_fcm_tokens").document("token_${userId}_${devId}").delete().await()
-        } catch (_: Exception) {}
-    }
-
-    fun getStorage(context: Context): FirebaseStorage {
-        return storageInstance ?: synchronized(this) {
-            storageInstance ?: run {
-                if (FirebaseApp.getApps(context).isEmpty()) {
-                    FirebaseApp.initializeApp(context)
-                }
-                val storage = FirebaseStorage.getInstance()
-                storageInstance = storage
-                storage
-            }
-        }
-    }
-
-    fun createCameraOutputUri(context: Context): Uri {
-        val imagesFolder = File(context.cacheDir, "camera_images").apply { mkdirs() }
-        val tempFile = File(imagesFolder, "capture_${System.currentTimeMillis()}_${UUID.randomUUID().toString().take(6)}.jpg")
-        return FileProvider.getUriForFile(
-            context,
-            "${context.packageName}.fileprovider",
-            tempFile
-        )
-    }
-
-    suspend fun uploadImageToCloud(
-        context: Context,
-        uri: Uri,
-        folder: String,
-        userId: Int
-    ): Pair<String, String> = withContext(Dispatchers.IO) {
-        val fileName = "${folder}/${userId}/${System.currentTimeMillis()}_${UUID.randomUUID().toString().take(6)}.jpg"
-        try {
-            val storage = getStorage(context)
-            val ref = storage.reference.child(fileName)
-            val uploadTask = ref.putFile(uri).await()
-            val downloadUrl = ref.downloadUrl.await().toString()
-            Pair(downloadUrl, fileName)
+    /**
+     * Removes this device's FCM token binding on logout or account switch so private notifications
+     * are never delivered after sign-out.
+     */
+    suspend fun removeDeviceFcmToken(context: Context, userId: Int): Boolean {
+        if (userId <= 0) return false
+        val db = getFirestore(context) ?: return false
+        val deviceId = getStableDeviceId(context)
+        val docId = buildTokenDocId(userId, deviceId)
+        return try {
+            db.collection(COLLECTION_NOTIFICATIONS)
+                .document(docId)
+                .delete()
+                .await()
+            Log.d(TAG, "Removed FCM token doc $docId on logout")
+            true
         } catch (e: Exception) {
-            // Local fallback if Firebase Storage is unavailable or offline
-            Pair(uri.toString(), fileName)
+            Log.w(TAG, "Notice removing FCM token doc: ${e.message}")
+            false
         }
     }
 
-    suspend fun saveImageToGallery(context: Context, imageUrl: String): Result<String> = withContext(Dispatchers.IO) {
+    /**
+     * Real-time authorized push notification listener on `community_notifications`.
+     * Delivers OS notifications when the app is in background or viewing another screen,
+     * strictly filtered by recipient userId and deduplicated atomically with FCM by messageId.
+     */
+    @Synchronized
+    fun startNotificationPushListener(context: Context, userId: Int) {
+        if (userId <= 0) {
+            stopNotificationPushListener()
+            return
+        }
+        if (listeningForUserId == userId && notificationListenerReg != null) {
+            return
+        }
+        stopNotificationPushListener()
+
+        val appCtx = context.applicationContext
+        val db = getFirestore(appCtx) ?: return
+        val listenerStartMs = System.currentTimeMillis() - 4_000L
+        listeningForUserId = userId
+
         try {
-            val bitmap = when {
-                imageUrl.startsWith("content://") || imageUrl.startsWith("file://") -> {
-                    context.contentResolver.openInputStream(Uri.parse(imageUrl))?.use {
-                        BitmapFactory.decodeStream(it)
+            notificationListenerReg = db.collection(COLLECTION_NOTIFICATIONS)
+                .orderBy("timestamp", Query.Direction.DESCENDING)
+                .limit(20)
+                .addSnapshotListener { snapshot, error ->
+                    if (error != null || snapshot == null) return@addSnapshotListener
+                    val activeUid = SamiFirebaseMessagingService.getCurrentUserId(appCtx)
+                    if (activeUid <= 0 || activeUid != userId) return@addSnapshotListener
+
+                    for (change in snapshot.documentChanges) {
+                        if (change.type != DocumentChange.Type.ADDED) continue
+                        val data = change.document.data
+                        val type = (data["type"] as? String) ?: ""
+                        if (type == "fcm_device_token") continue
+
+                        val ts = (data["timestamp"] as? Number)?.toLong() ?: 0L
+                        if (ts < listenerStartMs) continue
+
+                        val senderId = (data["senderId"] as? Number)?.toInt() ?: 0
+                        if (senderId == activeUid) continue
+
+                        val rawTargets = data["targetUserIds"] as? List<*>
+                        val targetIds = rawTargets?.mapNotNull { (it as? Number)?.toInt() } ?: emptyList()
+                        if (!targetIds.contains(activeUid)) continue
+
+                        val chatType = if (
+                            (data["chatType"] as? String) == "private" || type == "private_message"
+                        ) "private" else "channel"
+
+                        val title = (data["title"] as? String)?.ifBlank { "رسالة جديدة - Sami" }
+                            ?: "رسالة جديدة - Sami"
+                        val body = (data["body"] as? String)?.ifBlank { "لديك رسالة جديدة" }
+                            ?: "لديك رسالة جديدة"
+                        val channelId = (data["channelId"] as? String) ?: ""
+                        val partnerId = ((data["partnerId"] as? Number)
+                            ?: (data["privateChatWithUserId"] as? Number))?.toInt()
+                            ?: if (chatType == "private") senderId else null
+                        val messageId = (data["messageId"] as? String)?.ifBlank { null }
+                            ?: (data["id"] as? String)
+                            ?: change.document.id
+                        val senderName = (data["senderName"] as? String) ?: "Sami"
+
+                        SamiFirebaseMessagingService.postAuthorizedSystemNotification(
+                            context = appCtx,
+                            title = title,
+                            body = body,
+                            chatType = chatType,
+                            channelId = channelId,
+                            partnerId = partnerId,
+                            messageId = messageId,
+                            senderId = senderId,
+                            senderName = senderName,
+                            targetRecipientId = activeUid
+                        )
                     }
                 }
-                imageUrl.startsWith("http://") || imageUrl.startsWith("https://") -> {
-                    val stream = URL(imageUrl).openStream()
-                    BitmapFactory.decodeStream(stream)
-                }
-                else -> null
-            } ?: return@withContext Result.failure(Exception("تعذر تحميل بيانات الصورة"))
-
-            val fileName = "Sami_Trading_${System.currentTimeMillis()}.jpg"
-
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                val contentValues = ContentValues().apply {
-                    put(MediaStore.MediaColumns.DISPLAY_NAME, fileName)
-                    put(MediaStore.MediaColumns.MIME_TYPE, "image/jpeg")
-                    put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_PICTURES + "/SamiTrading")
-                }
-                val uri = context.contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, contentValues)
-                    ?: return@withContext Result.failure(Exception("تعذر إنشاء مسار الصورة في المعرض"))
-                context.contentResolver.openOutputStream(uri)?.use { out ->
-                    bitmap.compress(Bitmap.CompressFormat.JPEG, 95, out)
-                }
-            } else {
-                val dir = File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_PICTURES), "SamiTrading").apply { mkdirs() }
-                val file = File(dir, fileName)
-                FileOutputStream(file).use { out ->
-                    bitmap.compress(Bitmap.CompressFormat.JPEG, 95, out)
-                }
-            }
-
-            Result.success("تم حفظ الصورة في المعرض بنجاح")
         } catch (e: Exception) {
-            Result.failure(e)
+            Log.w(TAG, "Failed starting notification push listener: ${e.message}")
         }
     }
 
-    suspend fun fetchUserChallengeFromFirestore(
-        context: Context,
-        userId: Int
-    ): Pair<ChallengeEntity, List<TradeEntity>>? = withContext(Dispatchers.IO) {
+    @Synchronized
+    fun stopNotificationPushListener() {
         try {
-            val db = getFirestore(context)
-            val doc = db.collection("user_challenges").document("user_$userId").get().await()
-            if (!doc.exists()) return@withContext null
+            notificationListenerReg?.remove()
+        } catch (_: Exception) {}
+        notificationListenerReg = null
+        listeningForUserId = 0
+    }
 
-            val challengeData = doc.get("challenge") as? Map<String, Any> ?: return@withContext null
-            val ch = ChallengeEntity(
-                id = challengeData["id"] as? String ?: UUID.randomUUID().toString(),
-                userId = (challengeData["userId"] as? Number)?.toInt() ?: userId,
-                userName = challengeData["userName"] as? String ?: "",
-                initialCapitalCents = (challengeData["initialCapitalCents"] as? Number)?.toLong() ?: 10000L,
-                currentBalanceCents = (challengeData["currentBalanceCents"] as? Number)?.toLong() ?: 10000L,
-                targetBalanceCents = (challengeData["targetBalanceCents"] as? Number)?.toLong() ?: 300000L,
-                tradeCount = (challengeData["tradeCount"] as? Number)?.toInt() ?: 0,
-                challengeStarted = challengeData["challengeStarted"] as? Boolean ?: false,
-                createdAt = (challengeData["createdAt"] as? Number)?.toLong() ?: System.currentTimeMillis(),
-                updatedAt = (challengeData["updatedAt"] as? Number)?.toLong() ?: System.currentTimeMillis()
-            )
+    /**
+     * Compresses an image Uri and uploads to Firebase Cloud Storage (`chat_images/{userId}/{uuid}.jpg`).
+     */
+    suspend fun uploadChatImage(
+        context: Context,
+        imageUri: Uri,
+        userId: Int,
+        folder: String = "chat_images"
+    ): Pair<String, String>? {
+        val storage = getStorage(context) ?: return null
+        return try {
+            val bytes = compressUriToJpeg(context, imageUri, 1280, 82) ?: return null
+            val fileId = "${folder}_${userId}_${System.currentTimeMillis()}_${UUID.randomUUID().toString().take(6)}"
+            val storagePath = "$folder/$fileId.jpg"
+            val storageRef = storage.reference.child(storagePath)
 
-            val tradesRaw = doc.get("trades") as? List<Map<String, Any>> ?: emptyList()
-            val tradesList = tradesRaw.map { t ->
-                TradeEntity(
-                    id = t["id"] as? String ?: UUID.randomUUID().toString(),
-                    challengeId = t["challengeId"] as? String ?: ch.id,
-                    tradeNumber = (t["tradeNumber"] as? Number)?.toInt() ?: 1,
-                    resultCents = (t["resultCents"] as? Number)?.toLong() ?: 0L,
-                    oldBalanceCents = (t["oldBalanceCents"] as? Number)?.toLong() ?: 0L,
-                    newBalanceCents = (t["newBalanceCents"] as? Number)?.toLong() ?: 0L,
-                    type = if ((t["type"] as? String) == "LOSS") TradeType.LOSS else TradeType.WIN,
-                    attachmentPath = t["attachmentPath"] as? String,
-                    timestamp = (t["timestamp"] as? Number)?.toLong() ?: System.currentTimeMillis()
-                )
-            }
+            val metadata = StorageMetadata.Builder()
+                .setContentType("image/jpeg")
+                .setCustomMetadata("uploaderId", userId.toString())
+                .build()
 
-            Pair(ch, tradesList)
+            storageRef.putBytes(bytes, metadata).await()
+            val downloadUrl = storageRef.downloadUrl.await().toString()
+            Pair(downloadUrl, storagePath)
         } catch (e: Exception) {
+            Log.e(TAG, "Error uploading image to Firebase Storage", e)
             null
         }
     }
 
-    suspend fun syncUserChallengeToFirestore(
-        context: Context,
-        userId: Int,
-        challenge: ChallengeEntity,
-        trades: List<TradeEntity>
-    ) = withContext(Dispatchers.IO) {
+    suspend fun deleteStoragePath(context: Context, storagePath: String?) {
+        if (storagePath.isNullOrBlank()) return
+        val storage = getStorage(context) ?: return
         try {
-            val db = getFirestore(context)
-            val challengeMap = mapOf(
-                "id" to challenge.id,
-                "userId" to challenge.userId,
-                "userName" to challenge.userName,
-                "initialCapitalCents" to challenge.initialCapitalCents,
-                "currentBalanceCents" to challenge.currentBalanceCents,
-                "targetBalanceCents" to challenge.targetBalanceCents,
-                "tradeCount" to challenge.tradeCount,
-                "challengeStarted" to challenge.challengeStarted,
-                "createdAt" to challenge.createdAt,
-                "updatedAt" to challenge.updatedAt
-            )
-            val tradesMapList = trades.map { t ->
-                mapOf(
-                    "id" to t.id,
-                    "challengeId" to t.challengeId,
-                    "tradeNumber" to t.tradeNumber,
-                    "resultCents" to t.resultCents,
-                    "oldBalanceCents" to t.oldBalanceCents,
-                    "newBalanceCents" to t.newBalanceCents,
-                    "type" to t.type.name,
-                    "attachmentPath" to t.attachmentPath,
-                    "timestamp" to t.timestamp
-                )
-            }
-            db.collection("user_challenges").document("user_$userId").set(
-                mapOf(
-                    "userId" to userId,
-                    "challenge" to challengeMap,
-                    "trades" to tradesMapList,
-                    "lastSyncAt" to System.currentTimeMillis()
-                )
-            ).await()
-        } catch (_: Exception) {}
+            storage.reference.child(storagePath).delete().await()
+        } catch (e: Exception) {
+            Log.w(TAG, "Error deleting file at $storagePath: ${e.message}")
+        }
     }
 
-    suspend fun deleteMultipleCloudImages(context: Context, paths: List<String?>) = withContext(Dispatchers.IO) {
-        try {
-            val storage = getStorage(context)
-            paths.filterNotNull().forEach { path ->
-                if (path.startsWith("trade_images/") || path.startsWith("chat_images/")) {
-                    try {
-                        storage.reference.child(path).delete().await()
-                    } catch (_: Exception) {}
+    private fun compressUriToJpeg(
+        context: Context,
+        uri: Uri,
+        maxDimension: Int,
+        quality: Int
+    ): ByteArray? {
+        return try {
+            val boundsOptions = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+            context.contentResolver.openInputStream(uri)?.use {
+                BitmapFactory.decodeStream(it, null, boundsOptions)
+            }
+            var inSampleSize = 1
+            val rawW = boundsOptions.outWidth
+            val rawH = boundsOptions.outHeight
+            if (rawW > maxDimension || rawH > maxDimension) {
+                var halfW = rawW / 2
+                var halfH = rawH / 2
+                while ((halfW / inSampleSize) >= maxDimension || (halfH / inSampleSize) >= maxDimension) {
+                    inSampleSize *= 2
                 }
             }
-        } catch (_: Exception) {}
+
+            val decodeOptions = BitmapFactory.Options().apply { this.inSampleSize = inSampleSize }
+            val decoded = context.contentResolver.openInputStream(uri)?.use {
+                BitmapFactory.decodeStream(it, null, decodeOptions)
+            } ?: return null
+
+            val scaled = scaleDownBitmap(decoded, maxDimension)
+            val baos = ByteArrayOutputStream()
+            scaled.compress(Bitmap.CompressFormat.JPEG, quality, baos)
+            if (scaled != decoded) scaled.recycle()
+            decoded.recycle()
+            baos.toByteArray()
+        } catch (e: Exception) {
+            Log.e(TAG, "Image compression failed", e)
+            null
+        }
+    }
+
+    private fun scaleDownBitmap(src: Bitmap, maxDim: Int): Bitmap {
+        val w = src.width
+        val h = src.height
+        if (w <= maxDim && h <= maxDim) return src
+        val ratio = w.toFloat() / h.toFloat()
+        val (targetW, targetH) = if (w > h) {
+            maxDim to (maxDim / ratio).toInt().coerceAtLeast(1)
+        } else {
+            (maxDim * ratio).toInt().coerceAtLeast(1) to maxDim
+        }
+        return Bitmap.createScaledBitmap(src, targetW, targetH, true)
     }
 }
