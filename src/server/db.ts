@@ -802,6 +802,10 @@ export async function addTradeRecord(userId: number, trade: TradeRecord, updated
 
 export interface PrivateMessageRecord {
   id: string;
+  conversationId?: string;
+  participantId?: number;
+  participantName?: string;
+  participantIds?: number[];
   senderId: number;
   receiverId: number;
   senderName: string;
@@ -816,32 +820,217 @@ export interface PrivateMessageRecord {
   fileName?: string;
   fileSize?: number;
   fileType?: string;
+  replyToId?: string | null;
+  replyToSenderName?: string | null;
+  replyToText?: string | null;
+  replyToIsDeleted?: boolean;
+  isEdited?: boolean;
+  isDeleted?: boolean;
   timestamp: number;
 }
 
+export function buildCanonicalConversationId(userId1: number | string, userId2: number | string): string {
+  const a = Number(userId1) || 0;
+  const b = Number(userId2) || 0;
+  return [a, b].sort((x, y) => x - y).join('_');
+}
+
+function normalizeMessageTimestamp(rawTs: any, fallbackId?: string): number {
+  if (typeof rawTs === 'number' && Number.isFinite(rawTs) && rawTs > 0) {
+    return rawTs < 1e11 ? Math.floor(rawTs * 1000) : Math.floor(rawTs);
+  }
+  if (typeof rawTs === 'string' && rawTs.trim()) {
+    const trimmed = rawTs.trim();
+    if (/^\d+$/.test(trimmed)) {
+      const n = Number(trimmed);
+      if (Number.isFinite(n) && n > 0) return n < 1e11 ? Math.floor(n * 1000) : Math.floor(n);
+    }
+    const parsed = Date.parse(trimmed);
+    if (!Number.isNaN(parsed) && parsed > 0) return parsed;
+  }
+  if (rawTs && typeof rawTs === 'object') {
+    if (typeof rawTs.toMillis === 'function') {
+      const ms = Number(rawTs.toMillis());
+      if (Number.isFinite(ms) && ms > 0) return ms;
+    }
+    if (typeof rawTs.seconds === 'number') {
+      return rawTs.seconds * 1000 + Math.floor((Number(rawTs.nanoseconds) || 0) / 1e6);
+    }
+  }
+  if (fallbackId) {
+    const m = /^pm_(\d{10,15})_/.exec(fallbackId);
+    if (m) return Number(m[1]);
+  }
+  return Date.now();
+}
+
+function normalizeRawPrivateMessage(raw: any, fallbackDocId = ''): PrivateMessageRecord | null {
+  if (!raw || typeof raw !== 'object') return null;
+  const id = String(raw.id || fallbackDocId || '').trim();
+  const senderId = Number(raw.senderId || 0);
+  if (!id || senderId <= 0) return null;
+
+  const legacyParticipantId = Number(raw.participantId || 0);
+  let receiverId = Number(raw.receiverId || 0);
+  if (receiverId <= 0 && Array.isArray(raw.participantIds)) {
+    const other = raw.participantIds.map(Number).find((n: number) => n > 0 && n !== senderId);
+    if (other) receiverId = other;
+  }
+  if (receiverId <= 0 && typeof raw.conversationId === 'string' && raw.conversationId.includes('_')) {
+    const parts = raw.conversationId.split('_').map(Number).filter((n: number) => n > 0);
+    const other = parts.find((n: number) => n !== senderId);
+    if (other) receiverId = other;
+  }
+  if (receiverId <= 0) {
+    receiverId = senderId === 1 && legacyParticipantId > 0 ? legacyParticipantId : 1;
+  }
+
+  const conversationId = buildCanonicalConversationId(senderId, receiverId);
+  const participantIds = [Math.min(senderId, receiverId), Math.max(senderId, receiverId)];
+  const participantId =
+    legacyParticipantId > 0
+      ? legacyParticipantId
+      : senderId === 1
+        ? receiverId
+        : receiverId === 1
+          ? senderId
+          : raw.senderRole === 'moderator'
+            ? receiverId
+            : senderId;
+
+  return {
+    id,
+    conversationId,
+    participantId,
+    participantName: typeof raw.participantName === 'string' ? raw.participantName : undefined,
+    participantIds,
+    senderId,
+    receiverId,
+    senderName: String(raw.senderName || 'مستخدم'),
+    senderRole: senderId === 1 ? 'owner' : String(raw.senderRole || 'user'),
+    senderAvatarUrl: typeof raw.senderAvatarUrl === 'string' ? raw.senderAvatarUrl : null,
+    text: typeof raw.text === 'string' ? raw.text : undefined,
+    imageUrl: typeof raw.imageUrl === 'string' ? raw.imageUrl : undefined,
+    storagePath: typeof raw.storagePath === 'string' ? raw.storagePath : undefined,
+    audioUrl: typeof raw.audioUrl === 'string' ? raw.audioUrl : undefined,
+    audioDuration: typeof raw.audioDuration === 'number' ? raw.audioDuration : undefined,
+    fileUrl: typeof raw.fileUrl === 'string' ? raw.fileUrl : undefined,
+    fileName: typeof raw.fileName === 'string' ? raw.fileName : undefined,
+    fileSize: typeof raw.fileSize === 'number' ? raw.fileSize : undefined,
+    fileType: typeof raw.fileType === 'string' ? raw.fileType : undefined,
+    replyToId: typeof raw.replyToId === 'string' ? raw.replyToId : null,
+    replyToSenderName: typeof raw.replyToSenderName === 'string' ? raw.replyToSenderName : null,
+    replyToText: typeof raw.replyToText === 'string' ? raw.replyToText : null,
+    replyToIsDeleted: Boolean(raw.replyToIsDeleted),
+    isEdited: Boolean(raw.isEdited),
+    isDeleted: Boolean(raw.isDeleted),
+    timestamp: normalizeMessageTimestamp(raw.timestamp ?? raw.createdAt ?? raw.updatedAt, id),
+  };
+}
+
+async function queryRestPrivateMessagesByField(fieldName: 'senderId' | 'receiverId', userId: number): Promise<PrivateMessageRecord[]> {
+  try {
+    const dbSeg = encodeURIComponent(databaseId || '(default)');
+    const url = `https://firestore.googleapis.com/v1/projects/${encodeURIComponent(projectId)}/databases/${dbSeg}/documents:runQuery`;
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        structuredQuery: {
+          from: [{ collectionId: 'private_messages' }],
+          where: {
+            fieldFilter: {
+              field: { fieldPath: fieldName },
+              op: 'EQUAL',
+              value: { integerValue: String(Math.floor(userId)) },
+            },
+          },
+        },
+      }),
+    });
+    if (!res.ok) return [];
+    const rows: any[] = await res.json();
+    if (!Array.isArray(rows)) return [];
+    const out: PrivateMessageRecord[] = [];
+    const decodeField = (v: any): any => {
+      if (!v || typeof v !== 'object') return undefined;
+      if ('stringValue' in v) return v.stringValue;
+      if ('integerValue' in v) return Number(v.integerValue);
+      if ('doubleValue' in v) return Number(v.doubleValue);
+      if ('booleanValue' in v) return Boolean(v.booleanValue);
+      if ('timestampValue' in v) return Date.parse(v.timestampValue);
+      if ('nullValue' in v) return null;
+      if ('arrayValue' in v) return Array.isArray(v.arrayValue?.values) ? v.arrayValue.values.map(decodeField) : [];
+      return undefined;
+    };
+    for (const row of rows) {
+      const doc = row?.document;
+      const fields = doc?.fields;
+      if (!fields) continue;
+      const raw: Record<string, any> = {};
+      for (const [k, fv] of Object.entries(fields)) {
+        raw[k] = decodeField(fv);
+      }
+      const docId = String(doc?.name || '').split('/').pop() || '';
+      const norm = normalizeRawPrivateMessage(raw, docId);
+      if (norm) out.push(norm);
+    }
+    return out;
+  } catch {
+    return [];
+  }
+}
+
 export async function getPrivateMessagesList(userId1: number, userId2: number, limitCount = 80): Promise<PrivateMessageRecord[]> {
-  const pairKey = [userId1, userId2].sort((a, b) => a - b).join('_');
+  const u1 = Number(userId1);
+  const u2 = Number(userId2);
+  const pairKey = buildCanonicalConversationId(u1, u2);
+  const byId = new Map<string, PrivateMessageRecord>();
+
+  const addIfMatch = (raw: any, docId = '') => {
+    const norm = normalizeRawPrivateMessage(raw, docId);
+    if (!norm) return;
+    if ((norm.senderId === u1 && norm.receiverId === u2) || (norm.senderId === u2 && norm.receiverId === u1)) {
+      byId.set(norm.id, norm);
+    }
+  };
 
   if (firestoreClient) {
     try {
-      const snap = await firestoreClient
-        .collection('private_conversations')
-        .doc(pairKey)
-        .collection('messages')
-        .orderBy('timestamp', 'asc')
-        .limitToLast(limitCount)
-        .get();
-
-      if (!snap.empty) {
-        return snap.docs.map((d: any) => d.data() as PrivateMessageRecord);
-      }
+      const [sentSnap, recvSnap, subSnap] = await Promise.all([
+        firestoreClient.collection('private_messages').where('senderId', '==', u1).get().catch(() => null),
+        firestoreClient.collection('private_messages').where('receiverId', '==', u1).get().catch(() => null),
+        firestoreClient
+          .collection('private_conversations')
+          .doc(pairKey)
+          .collection('messages')
+          .get()
+          .catch(() => null),
+      ]);
+      sentSnap?.forEach((d: any) => addIfMatch(d.data(), d.id));
+      recvSnap?.forEach((d: any) => addIfMatch(d.data(), d.id));
+      subSnap?.forEach((d: any) => addIfMatch(d.data(), d.id));
     } catch (err: any) {
       console.warn('[Sami DB] Firestore private messages notice:', err.message);
     }
+  } else {
+    const [restSent, restRecv] = await Promise.all([
+      queryRestPrivateMessagesByField('senderId', u1),
+      queryRestPrivateMessagesByField('receiverId', u1),
+    ]);
+    for (const m of [...restSent, ...restRecv]) {
+      addIfMatch(m, m.id);
+    }
   }
 
-  const list = diskStore.privateMessages[pairKey] || [];
-  return list.slice(-limitCount);
+  for (const m of diskStore.privateMessages[pairKey] || []) {
+    addIfMatch(m, m?.id);
+  }
+
+  const merged = Array.from(byId.values()).sort(
+    (a, b) => a.timestamp - b.timestamp || a.id.localeCompare(b.id)
+  );
+  return limitCount > 0 ? merged.slice(-limitCount) : merged;
 }
 
 export async function getUserConversationsList(userId: number, userRole: string): Promise<{
@@ -854,6 +1043,7 @@ export async function getUserConversationsList(userId: number, userRole: string)
   lastMessageTimestamp: number;
   isGuest: boolean;
 }[]> {
+  const uid = Number(userId);
   const map = new Map<number, {
     conversationId: string;
     partnerId: number;
@@ -866,10 +1056,10 @@ export async function getUserConversationsList(userId: number, userRole: string)
   }>();
 
   // If moderator, ensure Sami (ID: 1) is always available as a primary conversation option
-  if (userRole === 'moderator' && userId !== 1) {
+  if (userRole === 'moderator' && uid !== 1) {
     const samiUser = await getUserById(1);
     map.set(1, {
-      conversationId: `1_${userId}`,
+      conversationId: buildCanonicalConversationId(1, uid),
       partnerId: 1,
       partnerName: samiUser?.displayName || 'القائد Sami',
       partnerRole: 'owner',
@@ -880,13 +1070,53 @@ export async function getUserConversationsList(userId: number, userRole: string)
     });
   }
 
-  // Iterate over persistent disk privateMessages
-  for (const [pairKey, msgs] of Object.entries(diskStore.privateMessages)) {
-    if (!Array.isArray(msgs) || msgs.length === 0) continue;
-    const parts = pairKey.split('_').map(Number);
-    if (parts.length !== 2 || !parts.includes(userId)) continue;
+  const allUserMsgs = new Map<string, PrivateMessageRecord>();
+  if (firestoreClient) {
+    try {
+      const [sentSnap, recvSnap] = await Promise.all([
+        firestoreClient.collection('private_messages').where('senderId', '==', uid).get().catch(() => null),
+        firestoreClient.collection('private_messages').where('receiverId', '==', uid).get().catch(() => null),
+      ]);
+      sentSnap?.forEach((d: any) => {
+        const m = normalizeRawPrivateMessage(d.data(), d.id);
+        if (m) allUserMsgs.set(m.id, m);
+      });
+      recvSnap?.forEach((d: any) => {
+        const m = normalizeRawPrivateMessage(d.data(), d.id);
+        if (m) allUserMsgs.set(m.id, m);
+      });
+    } catch {}
+  } else {
+    const [restSent, restRecv] = await Promise.all([
+      queryRestPrivateMessagesByField('senderId', uid),
+      queryRestPrivateMessagesByField('receiverId', uid),
+    ]);
+    for (const m of [...restSent, ...restRecv]) {
+      allUserMsgs.set(m.id, m);
+    }
+  }
 
-    const partnerId = parts[0] === userId ? parts[1] : parts[0];
+  for (const msgs of Object.values(diskStore.privateMessages)) {
+    if (!Array.isArray(msgs)) continue;
+    for (const raw of msgs) {
+      const m = normalizeRawPrivateMessage(raw, raw?.id);
+      if (m && (m.senderId === uid || m.receiverId === uid)) {
+        allUserMsgs.set(m.id, m);
+      }
+    }
+  }
+
+  const groupedByPartner = new Map<number, PrivateMessageRecord[]>();
+  for (const m of allUserMsgs.values()) {
+    const partnerId = m.senderId === uid ? m.receiverId : m.senderId;
+    if (!partnerId || partnerId === uid) continue;
+    const arr = groupedByPartner.get(partnerId) || [];
+    arr.push(m);
+    groupedByPartner.set(partnerId, arr);
+  }
+
+  for (const [partnerId, msgs] of groupedByPartner.entries()) {
+    msgs.sort((a, b) => a.timestamp - b.timestamp || a.id.localeCompare(b.id));
     const lastMsg = msgs[msgs.length - 1];
     const isGuest = partnerId > 9000000;
     const partnerUser = await getUserById(partnerId);
@@ -897,12 +1127,14 @@ export async function getUserConversationsList(userId: number, userRole: string)
     }
 
     map.set(partnerId, {
-      conversationId: pairKey,
+      conversationId: buildCanonicalConversationId(uid, partnerId),
       partnerId,
-      partnerName: partnerUser?.displayName || (isGuest ? `ضيف رقم ${partnerId - 9000000}` : `مستخدم #${partnerId}`),
-      partnerRole: partnerUser?.role || (isGuest ? 'guest' : 'user'),
+      partnerName: partnerUser?.displayName || lastMsg.participantName || (isGuest ? `ضيف رقم ${partnerId - 9000000}` : `مستخدم #${partnerId}`),
+      partnerRole: partnerId === 1 ? 'owner' : (partnerUser?.role || (isGuest ? 'guest' : 'user')),
       partnerAvatarUrl: partnerUser?.avatarUrl || null,
-      lastMessageText: lastMsg?.text || (lastMsg?.audioUrl ? '🎤 رسالة صوتية' : (lastMsg?.imageUrl ? '📷 صورة مرفقة' : (lastMsg?.fileName ? `📎 ملف: ${lastMsg.fileName}` : 'رسالة جديدة'))),
+      lastMessageText: lastMsg?.isDeleted
+        ? 'تم حذف هذه الرسالة.'
+        : (lastMsg?.text || (lastMsg?.audioUrl ? '🎤 رسالة صوتية' : (lastMsg?.imageUrl ? '📷 صورة مرفقة' : (lastMsg?.fileName ? `📎 ملف: ${lastMsg.fileName}` : 'رسالة جديدة')))),
       lastMessageTimestamp: lastMsg?.timestamp || Date.now(),
       isGuest,
     });
@@ -912,35 +1144,96 @@ export async function getUserConversationsList(userId: number, userRole: string)
 }
 
 export async function savePrivateMessageRecord(msg: PrivateMessageRecord): Promise<void> {
-  const pairKey = [msg.senderId, msg.receiverId].sort((a, b) => a - b).join('_');
+  const senderId = Number(msg.senderId);
+  const receiverId = Number(msg.receiverId);
+  const pairKey = buildCanonicalConversationId(senderId, receiverId);
+  const participantIds = [Math.min(senderId, receiverId), Math.max(senderId, receiverId)];
+  const participantId =
+    msg.participantId && Number(msg.participantId) > 0
+      ? Number(msg.participantId)
+      : senderId === 1
+        ? receiverId
+        : receiverId === 1
+          ? senderId
+          : msg.senderRole === 'moderator'
+            ? receiverId
+            : senderId;
 
+  const fullRecord: PrivateMessageRecord = {
+    ...msg,
+    senderId,
+    receiverId,
+    conversationId: pairKey,
+    participantIds,
+    participantId,
+    timestamp: normalizeMessageTimestamp(msg.timestamp, msg.id),
+  };
+
+  let savedToCloud = false;
   if (firestoreClient) {
     try {
-      await firestoreClient
-        .collection('private_conversations')
-        .doc(pairKey)
-        .collection('messages')
-        .doc(msg.id)
-        .set(msg);
-
-      await firestoreClient
-        .collection('private_messages')
-        .doc(msg.id)
-        .set({
-          ...msg,
-          conversationId: pairKey,
-          participantIds: [msg.senderId, msg.receiverId],
-          participantId: msg.senderId === 1 ? msg.receiverId : msg.senderId,
-        });
+      await Promise.all([
+        firestoreClient.collection('private_messages').doc(fullRecord.id).set(fullRecord, { merge: true }),
+        firestoreClient
+          .collection('private_conversations')
+          .doc(pairKey)
+          .collection('messages')
+          .doc(fullRecord.id)
+          .set(fullRecord, { merge: true }),
+      ]);
+      savedToCloud = true;
     } catch (err: any) {
       console.warn('[Sami DB] Firestore savePrivateMessage notice:', err.message);
     }
   }
 
+  if (!savedToCloud) {
+    try {
+      const dbSeg = encodeURIComponent(databaseId || '(default)');
+      const url = `https://firestore.googleapis.com/v1/projects/${encodeURIComponent(projectId)}/databases/${dbSeg}/documents/private_messages/${encodeURIComponent(fullRecord.id)}`;
+      const restFields: Record<string, any> = {
+        id: { stringValue: fullRecord.id },
+        conversationId: { stringValue: pairKey },
+        participantId: { integerValue: String(participantId) },
+        participantIds: {
+          arrayValue: { values: participantIds.map((id) => ({ integerValue: String(id) })) },
+        },
+        senderId: { integerValue: String(senderId) },
+        receiverId: { integerValue: String(receiverId) },
+        senderName: { stringValue: fullRecord.senderName || 'مستخدم' },
+        senderRole: { stringValue: fullRecord.senderRole || 'user' },
+        timestamp: { integerValue: String(fullRecord.timestamp) },
+        isDeleted: { booleanValue: Boolean(fullRecord.isDeleted) },
+      };
+      if (fullRecord.senderAvatarUrl) restFields.senderAvatarUrl = { stringValue: fullRecord.senderAvatarUrl };
+      if (fullRecord.participantName) restFields.participantName = { stringValue: fullRecord.participantName };
+      if (fullRecord.text) restFields.text = { stringValue: fullRecord.text };
+      if (fullRecord.imageUrl) restFields.imageUrl = { stringValue: fullRecord.imageUrl };
+      if (fullRecord.storagePath) restFields.storagePath = { stringValue: fullRecord.storagePath };
+      if (fullRecord.audioUrl) restFields.audioUrl = { stringValue: fullRecord.audioUrl };
+      if (typeof fullRecord.audioDuration === 'number') restFields.audioDuration = { integerValue: String(Math.floor(fullRecord.audioDuration)) };
+      if (fullRecord.fileUrl) restFields.fileUrl = { stringValue: fullRecord.fileUrl };
+      if (fullRecord.fileName) restFields.fileName = { stringValue: fullRecord.fileName };
+      if (typeof fullRecord.fileSize === 'number') restFields.fileSize = { integerValue: String(Math.floor(fullRecord.fileSize)) };
+      if (fullRecord.fileType) restFields.fileType = { stringValue: fullRecord.fileType };
+
+      await fetch(url, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ fields: restFields }),
+      });
+    } catch {}
+  }
+
   if (!diskStore.privateMessages[pairKey]) {
     diskStore.privateMessages[pairKey] = [];
   }
-  diskStore.privateMessages[pairKey].push(msg);
+  const existingIdx = diskStore.privateMessages[pairKey].findIndex((m: any) => m?.id === fullRecord.id);
+  if (existingIdx >= 0) {
+    diskStore.privateMessages[pairKey][existingIdx] = fullRecord;
+  } else {
+    diskStore.privateMessages[pairKey].push(fullRecord);
+  }
   saveLocalDiskStore(diskStore);
 }
 

@@ -81,7 +81,7 @@ class MainActivity : ComponentActivity() {
 
     private val viewModel: MainViewModel by viewModels()
     private var activeWebView: WebView? = null
-    private var pendingDeepLinkScript: String? = null
+    internal var pendingDeepLinkScript: String? = null
 
     private val notificationPermissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestPermission()
@@ -540,10 +540,10 @@ fun FullAppWebView(
                                     null
                                 )
                             }
-                            pendingDeepLinkScript?.let { script ->
+                            activity.pendingDeepLinkScript?.let { script: String ->
                                 view?.postDelayed({ view.evaluateJavascript(script, null) }, 400)
                                 view?.postDelayed({ view.evaluateJavascript(script, null) }, 1200)
-                                pendingDeepLinkScript = null
+                                activity.pendingDeepLinkScript = null
                             }
                         }
 

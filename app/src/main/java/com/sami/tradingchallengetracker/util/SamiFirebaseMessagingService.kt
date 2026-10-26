@@ -147,8 +147,8 @@ class SamiFirebaseMessagingService : FirebaseMessagingService() {
         val body = data["body"] ?: notification?.body ?: "لديك إشعار جديد في تطبيق Sami"
         val chatType = data["chatType"] ?: if (!data["partnerId"].isNullOrBlank()) "private" else "channel"
         val channelId = data["channelId"] ?: ""
-        val partnerId = data["partnerId"]?.toIntOrNull()
         val senderId = data["senderId"]?.toIntOrNull()
+        val partnerId = data["partnerId"]?.toIntOrNull() ?: if (chatType == "private") senderId else null
         val messageId = data["messageId"] ?: remoteMessage.messageId ?: ""
         val senderName = data["senderName"] ?: ""
 
