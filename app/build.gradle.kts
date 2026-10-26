@@ -92,11 +92,19 @@ android {
             excludes += "META-INF/LICENSE*"
             excludes += "META-INF/NOTICE*"
             excludes += "META-INF/*.version"
+            excludes += "META-INF/INDEX.LIST"
+            excludes += "META-INF/io.netty.versions.properties"
             excludes += "**/*.proto"
         }
         jniLibs {
             useLegacyPackaging = false
         }
+    }
+}
+
+tasks.configureEach {
+    if (name.contains("ArtProfile")) {
+        enabled = false
     }
 }
 

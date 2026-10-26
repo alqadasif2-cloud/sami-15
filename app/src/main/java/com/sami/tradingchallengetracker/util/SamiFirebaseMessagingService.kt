@@ -118,6 +118,8 @@ class SamiFirebaseMessagingService : FirebaseMessagingService() {
         val cleanToken = token.trim()
         if (cleanToken.isEmpty()) return
 
+        FirebaseCloudHelper.ensureInitialized(applicationContext)
+
         val prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
         prefs.edit().putString(KEY_FCM_TOKEN, cleanToken).apply()
 

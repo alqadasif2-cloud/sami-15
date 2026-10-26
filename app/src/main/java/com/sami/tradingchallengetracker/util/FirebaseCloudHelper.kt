@@ -10,6 +10,7 @@ import android.os.Environment
 import android.provider.MediaStore
 import androidx.core.content.FileProvider
 import com.google.firebase.FirebaseApp
+import com.google.firebase.FirebaseOptions
 import com.google.firebase.firestore.FirebaseFirestore
 import com.google.firebase.firestore.FirebaseFirestoreSettings
 import com.google.firebase.firestore.PersistentCacheSettings
@@ -33,9 +34,40 @@ object FirebaseCloudHelper {
     @Volatile
     private var storageInstance: FirebaseStorage? = null
 
+    private const val SHARED_FIREBASE_PROJECT_ID = "majestic-interface-ksmzh"
+    private const val SHARED_FIREBASE_APP_ID = "1:462035009117:web:ef127abfd25d8ff2ec17b4"
+    private const val SHARED_FIREBASE_API_KEY = "AIzaSyCWSCiM0EVatqiBL5wUO8ZAfKcJHqud9dU"
+    private const val SHARED_FIREBASE_SENDER_ID = "462035009117"
+    private const val SHARED_FIREBASE_STORAGE_BUCKET = "majestic-interface-ksmzh.firebasestorage.app"
     private const val SHARED_FIRESTORE_DB_ID = "ai-studio-c1d1b606-9578-42a6-b7b2-17faaec47f72"
     private const val FCM_PREFS = "sami_fcm_prefs"
     private const val KEY_STABLE_DEVICE_ID = "key_stable_device_id"
+
+    fun ensureInitialized(context: Context): FirebaseApp? {
+        val appCtx = context.applicationContext ?: context
+        return try {
+            if (FirebaseApp.getApps(appCtx).isNotEmpty()) {
+                FirebaseApp.getInstance()
+            } else {
+                FirebaseApp.initializeApp(appCtx) ?: run {
+                    val options = FirebaseOptions.Builder()
+                        .setProjectId(SHARED_FIREBASE_PROJECT_ID)
+                        .setApplicationId(SHARED_FIREBASE_APP_ID)
+                        .setApiKey(SHARED_FIREBASE_API_KEY)
+                        .setGcmSenderId(SHARED_FIREBASE_SENDER_ID)
+                        .setStorageBucket(SHARED_FIREBASE_STORAGE_BUCKET)
+                        .build()
+                    FirebaseApp.initializeApp(appCtx, options)
+                }
+            }
+        } catch (_: Exception) {
+            try {
+                FirebaseApp.getInstance()
+            } catch (_: Exception) {
+                null
+            }
+        }
+    }
 
     fun getStableDeviceId(context: Context): String {
         val prefs = context.getSharedPreferences(FCM_PREFS, Context.MODE_PRIVATE)
@@ -49,15 +81,7 @@ object FirebaseCloudHelper {
     fun getFirestore(context: Context): FirebaseFirestore {
         return firestoreInstance ?: synchronized(this) {
             firestoreInstance ?: run {
-                val app = try {
-                    if (FirebaseApp.getApps(context).isEmpty()) {
-                        FirebaseApp.initializeApp(context)
-                    } else {
-                        FirebaseApp.getInstance()
-                    }
-                } catch (_: Exception) {
-                    null
-                }
+                val app = ensureInitialized(context)
 
                 val db = try {
                     if (app != null) {
@@ -66,7 +90,11 @@ object FirebaseCloudHelper {
                         FirebaseFirestore.getInstance(SHARED_FIRESTORE_DB_ID)
                     }
                 } catch (_: Exception) {
-                    FirebaseFirestore.getInstance()
+                    if (app != null) {
+                        FirebaseFirestore.getInstance(app)
+                    } else {
+                        FirebaseFirestore.getInstance()
+                    }
                 }
 
                 try {

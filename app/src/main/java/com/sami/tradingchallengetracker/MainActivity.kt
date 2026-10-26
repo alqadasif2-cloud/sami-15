@@ -85,7 +85,7 @@ class MainActivity : ComponentActivity() {
 
     private val notificationPermissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestPermission()
-    ) { isGranted ->
+    ) { isGranted: Boolean ->
         android.util.Log.d("SamiApp", "POST_NOTIFICATIONS granted: $isGranted")
         if (isGranted) {
             initFcmToken()
@@ -93,11 +93,13 @@ class MainActivity : ComponentActivity() {
     }
 
     private var pendingWebAudioPermissionRequest: android.webkit.PermissionRequest? = null
+    private var isRequestingAudioPermission: Boolean = false
 
     private val audioPermissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestPermission()
-    ) { isGranted ->
+    ) { isGranted: Boolean ->
         android.util.Log.d("SamiApp", "RECORD_AUDIO granted: $isGranted")
+        isRequestingAudioPermission = false
         val pendingReq = pendingWebAudioPermissionRequest
         pendingWebAudioPermissionRequest = null
         if (pendingReq != null) {
@@ -122,12 +124,18 @@ class MainActivity : ComponentActivity() {
             if (webRequest != null) {
                 pendingWebAudioPermissionRequest = webRequest
             }
-            audioPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
+            if (!isRequestingAudioPermission) {
+                isRequestingAudioPermission = true
+                audioPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
+            }
         }
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+
+        // 0. Ensure FirebaseApp is initialized before Messaging/Firestore calls
+        FirebaseCloudHelper.ensureInitialized(this)
 
         // 1. Initialize notification channels
         SamiFirebaseMessagingService.createNotificationChannels(this)
@@ -248,29 +256,34 @@ class MainActivity : ComponentActivity() {
 
     fun initFcmToken() {
         try {
+            FirebaseCloudHelper.ensureInitialized(this)
             FirebaseMessaging.getInstance().token.addOnCompleteListener { task ->
-                if (task.isSuccessful && task.result != null) {
-                    val token = task.result
-                    android.util.Log.d("SamiFCM", "Device FCM Token: $token")
-                    getSharedPreferences(SamiFirebaseMessagingService.PREFS_NAME, Context.MODE_PRIVATE)
-                        .edit()
-                        .putString(SamiFirebaseMessagingService.KEY_FCM_TOKEN, token)
-                        .apply()
+                if (task.isSuccessful) {
+                    val token = task.result?.trim() ?: ""
+                    if (token.isNotEmpty()) {
+                        android.util.Log.d("SamiFCM", "Device FCM Token: $token")
+                        getSharedPreferences(SamiFirebaseMessagingService.PREFS_NAME, Context.MODE_PRIVATE)
+                            .edit()
+                            .putString(SamiFirebaseMessagingService.KEY_FCM_TOKEN, token)
+                            .apply()
 
-                    // Forward to active web session if loaded
-                    activeWebView?.post {
-                        activeWebView?.evaluateJavascript(
-                            "if (typeof window !== 'undefined' && typeof window.registerAndroidFcmToken === 'function') { window.registerAndroidFcmToken('$token', 0, ''); }",
-                            null
-                        )
-                    }
+                        val safeTok = escapeJsString(token)
+                        val devId = escapeJsString(FirebaseCloudHelper.getStableDeviceId(this@MainActivity))
+                        // Forward to active web session if loaded
+                        activeWebView?.post {
+                            activeWebView?.evaluateJavascript(
+                                "if (typeof window !== 'undefined' && typeof window.registerAndroidFcmToken === 'function') { window.registerAndroidFcmToken('$safeTok', 0, '', '$devId'); }",
+                                null
+                            )
+                        }
 
-                    // If user was previously logged in, re-sync token immediately
-                    val savedUserId = SamiFirebaseMessagingService.getCurrentUserId(this@MainActivity)
-                    if (savedUserId > 0) {
-                        val savedUsername = getSharedPreferences(SamiFirebaseMessagingService.PREFS_NAME, Context.MODE_PRIVATE)
-                            .getString(SamiFirebaseMessagingService.KEY_CURRENT_USERNAME, "") ?: ""
-                        syncFcmTokenToFirestore(savedUserId, savedUsername)
+                        // If user was previously logged in, re-sync token immediately
+                        val savedUserId = SamiFirebaseMessagingService.getCurrentUserId(this@MainActivity)
+                        if (savedUserId > 0) {
+                            val savedUsername = getSharedPreferences(SamiFirebaseMessagingService.PREFS_NAME, Context.MODE_PRIVATE)
+                                .getString(SamiFirebaseMessagingService.KEY_CURRENT_USERNAME, "") ?: ""
+                            syncFcmTokenToFirestore(savedUserId, savedUsername, token)
+                        }
                     }
                 } else {
                     android.util.Log.w("SamiFCM", "Failed to retrieve FCM token", task.exception)
@@ -379,14 +392,8 @@ class SamiAndroidBridge(
     }
 
     @JavascriptInterface
-    fun syncUserSession(userId: Int, username: String) {
-        SamiFirebaseMessagingService.saveCurrentSession(activity, userId, username)
-        activity.syncFcmTokenToFirestore(userId, username)
-    }
-
-    @JavascriptInterface
     fun syncUserSession(userId: String, username: String) {
-        val uid = userId.toIntOrNull() ?: 0
+        val uid = userId.trim().toIntOrNull() ?: 0
         if (uid > 0) {
             SamiFirebaseMessagingService.saveCurrentSession(activity, uid, username)
             activity.syncFcmTokenToFirestore(uid, username)
@@ -399,8 +406,8 @@ class SamiAndroidBridge(
     }
 
     @JavascriptInterface
-    fun unregisterFcmToken(userId: String) {
-        val uid = userId.toIntOrNull() ?: SamiFirebaseMessagingService.getCurrentUserId(activity)
+    fun unregisterFcmToken() {
+        val uid = SamiFirebaseMessagingService.getCurrentUserId(activity)
         SamiFirebaseMessagingService.clearCurrentSession(activity)
         if (uid > 0) {
             activity.removeFcmTokenFromFirestore(uid)
@@ -409,7 +416,7 @@ class SamiAndroidBridge(
 
     @JavascriptInterface
     fun registerFcmToken(token: String, userId: String, username: String) {
-        val uid = userId.toIntOrNull() ?: 0
+        val uid = userId.trim().toIntOrNull() ?: 0
         val cleanTok = token.trim()
         if (cleanTok.isNotEmpty()) {
             activity.getSharedPreferences(SamiFirebaseMessagingService.PREFS_NAME, Context.MODE_PRIVATE)
