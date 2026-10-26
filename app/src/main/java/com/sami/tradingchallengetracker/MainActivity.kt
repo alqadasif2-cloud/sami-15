@@ -92,14 +92,36 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    private var pendingWebAudioPermissionRequest: android.webkit.PermissionRequest? = null
+
     private val audioPermissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestPermission()
     ) { isGranted ->
         android.util.Log.d("SamiApp", "RECORD_AUDIO granted: $isGranted")
+        val pendingReq = pendingWebAudioPermissionRequest
+        pendingWebAudioPermissionRequest = null
+        if (pendingReq != null) {
+            try {
+                if (isGranted) {
+                    pendingReq.grant(pendingReq.resources)
+                } else {
+                    pendingReq.deny()
+                }
+            } catch (_: Exception) {}
+        }
     }
 
-    fun requestAudioPermissionInternal() {
-        if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+    fun requestAudioPermissionInternal(webRequest: android.webkit.PermissionRequest? = null) {
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) {
+            if (webRequest != null) {
+                try {
+                    webRequest.grant(webRequest.resources)
+                } catch (_: Exception) {}
+            }
+        } else {
+            if (webRequest != null) {
+                pendingWebAudioPermissionRequest = webRequest
+            }
             audioPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
         }
     }
@@ -159,10 +181,19 @@ class MainActivity : ComponentActivity() {
         processDeepLinkIntent(intent)
     }
 
+    private fun escapeJsString(value: String): String {
+        return value
+            .replace("\\", "\\\\")
+            .replace("'", "\\'")
+            .replace("\n", "\\n")
+            .replace("\r", "")
+    }
+
     private fun processDeepLinkIntent(intent: Intent?) {
         if (intent == null) return
         val channelId = intent.getStringExtra("channelId") ?: ""
-        val partnerId = intent.getStringExtra("partnerId")?.toIntOrNull()
+        val partnerId = intent.getStringExtra("partnerIdStr")?.toIntOrNull()
+            ?: intent.getStringExtra("partnerId")?.toIntOrNull()
             ?: if (intent.hasExtra("partnerId")) {
                 val p = intent.getIntExtra("partnerId", 0)
                 if (p > 0) p else null
@@ -172,22 +203,43 @@ class MainActivity : ComponentActivity() {
         val senderName = intent.getStringExtra("senderName") ?: ""
 
         if (channelId.isNotEmpty() || (partnerId != null && partnerId > 0) || messageId.isNotEmpty()) {
+            val safeChan = if (channelId.isNotEmpty()) "'${escapeJsString(channelId)}'" else "null"
+            val safeMsg = if (messageId.isNotEmpty()) "'${escapeJsString(messageId)}'" else "null"
+            val safeSender = if (senderName.isNotEmpty()) "'${escapeJsString(senderName)}'" else "null"
+            val safeType = escapeJsString(chatType)
+
             val script = """
-                if (typeof window !== 'undefined' && typeof window.dispatchNotificationDeepLink === 'function') {
-                    window.dispatchNotificationDeepLink({
-                        channelId: ${if (channelId.isNotEmpty()) "'$channelId'" else "null"},
+                (function() {
+                    var payload = {
+                        channelId: $safeChan,
                         partnerId: ${partnerId ?: "null"},
-                        chatType: '$chatType',
-                        messageId: ${if (messageId.isNotEmpty()) "'$messageId'" else "null"},
-                        senderName: ${if (senderName.isNotEmpty()) "'$senderName'" else "null"}
-                    });
-                }
+                        privateChatWithUserId: ${partnerId ?: "null"},
+                        chatType: '$safeType',
+                        type: '${if (chatType == "private") "private_message" else "channel_important"}',
+                        messageId: $safeMsg,
+                        senderName: $safeSender
+                    };
+                    if (typeof window !== 'undefined') {
+                        window.__samiPendingDeepLink = payload;
+                        if (typeof window.dispatchNotificationDeepLink === 'function') {
+                            window.dispatchNotificationDeepLink(payload);
+                        } else {
+                            window.dispatchEvent(new CustomEvent('app_open_chat_message', { detail: payload }));
+                        }
+                    }
+                })();
             """.trimIndent()
 
-            if (activeWebView != null) {
-                activeWebView?.post {
-                    activeWebView?.evaluateJavascript(script, null)
-                }
+            // Clear consumed extras so rotation doesn't re-trigger old navigation
+            intent.removeExtra("channelId")
+            intent.removeExtra("partnerId")
+            intent.removeExtra("partnerIdStr")
+            intent.removeExtra("messageId")
+
+            val wv = activeWebView
+            if (wv != null) {
+                wv.post { wv.evaluateJavascript(script, null) }
+                wv.postDelayed({ wv.evaluateJavascript(script, null) }, 600)
             } else {
                 pendingDeepLinkScript = script
             }
@@ -254,40 +306,36 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    fun syncFcmTokenToFirestore(userId: Int, username: String) {
-        val token = SamiFirebaseMessagingService.getSavedToken(this) ?: return
+    fun syncFcmTokenToFirestore(userId: Int, username: String, explicitToken: String? = null) {
+        val token = (explicitToken ?: SamiFirebaseMessagingService.getSavedToken(this))?.trim() ?: return
+        if (token.isEmpty() || userId <= 0) return
+
+        val devId = FirebaseCloudHelper.getStableDeviceId(applicationContext)
         CoroutineScope(Dispatchers.IO).launch {
-            try {
-                val db = FirebaseCloudHelper.getFirestore(applicationContext)
-                val devId = "dev_android_${System.currentTimeMillis()}_${java.util.UUID.randomUUID().toString().substring(0, 8)}"
-                val docId = "token_${userId}_${devId}"
-                val now = System.currentTimeMillis()
+            FirebaseCloudHelper.syncDeviceFcmToken(
+                context = applicationContext,
+                token = token,
+                userId = userId,
+                username = username
+            )
 
-                val payload = hashMapOf(
-                    "id" to docId,
-                    "token" to token,
-                    "userId" to userId,
-                    "username" to username,
-                    "deviceId" to devId,
-                    "platform" to "android",
-                    "deviceModel" to "${Build.MANUFACTURER} ${Build.MODEL}",
-                    "updatedAt" to now,
-                    "createdAt" to now
-                )
-
-                db.collection("user_fcm_tokens").document(docId).set(payload)
-                android.util.Log.d("SamiFCM", "Token synced for user $userId")
-            } catch (e: Exception) {
-                android.util.Log.w("SamiFCM", "Error syncing token: ${e.message}")
-            }
-
-            // Sync with backend API via active WebView
+            // Sync with active WebView layer as well
+            val safeTok = escapeJsString(token)
+            val safeUser = escapeJsString(username)
+            val safeDev = escapeJsString(devId)
             activeWebView?.post {
                 activeWebView?.evaluateJavascript(
-                    "if (typeof fetch === 'function') { fetch('/api/fcm/register', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ token: '$token', userId: $userId, username: '$username', platform: 'android' }) }).catch(function(){}); }",
+                    "if (typeof window !== 'undefined' && typeof window.registerAndroidFcmToken === 'function') { window.registerAndroidFcmToken('$safeTok', $userId, '$safeUser', '$safeDev'); }",
                     null
                 )
             }
+        }
+    }
+
+    fun removeFcmTokenFromFirestore(userId: Int) {
+        if (userId <= 0) return
+        CoroutineScope(Dispatchers.IO).launch {
+            FirebaseCloudHelper.removeDeviceFcmToken(applicationContext, userId)
         }
     }
 
@@ -346,28 +394,54 @@ class SamiAndroidBridge(
     }
 
     @JavascriptInterface
+    fun getDeviceId(): String {
+        return FirebaseCloudHelper.getStableDeviceId(activity)
+    }
+
+    @JavascriptInterface
     fun unregisterFcmToken(userId: String) {
+        val uid = userId.toIntOrNull() ?: SamiFirebaseMessagingService.getCurrentUserId(activity)
         SamiFirebaseMessagingService.clearCurrentSession(activity)
+        if (uid > 0) {
+            activity.removeFcmTokenFromFirestore(uid)
+        }
     }
 
     @JavascriptInterface
     fun registerFcmToken(token: String, userId: String, username: String) {
         val uid = userId.toIntOrNull() ?: 0
-        if (uid > 0) {
-            activity.syncFcmTokenToFirestore(uid, username)
+        val cleanTok = token.trim()
+        if (cleanTok.isNotEmpty()) {
+            activity.getSharedPreferences(SamiFirebaseMessagingService.PREFS_NAME, Context.MODE_PRIVATE)
+                .edit()
+                .putString(SamiFirebaseMessagingService.KEY_FCM_TOKEN, cleanTok)
+                .apply()
         }
+        if (uid > 0) {
+            SamiFirebaseMessagingService.saveCurrentSession(activity, uid, username)
+            activity.syncFcmTokenToFirestore(uid, username, cleanTok.ifEmpty { null })
+        }
+    }
+
+    @JavascriptInterface
+    fun checkAudioPermission(): Boolean {
+        return ContextCompat.checkSelfPermission(activity, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
     }
 
     @JavascriptInterface
     fun requestAudioPermission() {
         activity.runOnUiThread {
-            activity.requestAudioPermissionInternal()
+            activity.requestAudioPermissionInternal(null)
         }
     }
 
     @JavascriptInterface
     fun onLogout() {
+        val prevUid = SamiFirebaseMessagingService.getCurrentUserId(activity)
         SamiFirebaseMessagingService.clearCurrentSession(activity)
+        if (prevUid > 0) {
+            activity.removeFcmTokenFromFirestore(prevUid)
+        }
     }
 }
 
@@ -449,13 +523,20 @@ fun FullAppWebView(
                         override fun onPageFinished(view: WebView?, url: String?) {
                             super.onPageFinished(view, url)
                             isLoading = false
-                            // Pass FCM token to Web layer on page ready
                             val token = SamiFirebaseMessagingService.getSavedToken(ctx)
-                            if (token != null) {
+                            val devId = FirebaseCloudHelper.getStableDeviceId(ctx)
+                            if (!token.isNullOrBlank()) {
+                                val safeTok = token.replace("\\", "\\\\").replace("'", "\\'")
+                                val safeDev = devId.replace("\\", "\\\\").replace("'", "\\'")
                                 view?.evaluateJavascript(
-                                    "if (typeof window !== 'undefined' && typeof window.registerAndroidFcmToken === 'function') { window.registerAndroidFcmToken('$token', 0, ''); }",
+                                    "if (typeof window !== 'undefined' && typeof window.registerAndroidFcmToken === 'function') { window.registerAndroidFcmToken('$safeTok', 0, '', '$safeDev'); }",
                                     null
                                 )
+                            }
+                            pendingDeepLinkScript?.let { script ->
+                                view?.postDelayed({ view.evaluateJavascript(script, null) }, 400)
+                                view?.postDelayed({ view.evaluateJavascript(script, null) }, 1200)
+                                pendingDeepLinkScript = null
                             }
                         }
 
@@ -482,13 +563,18 @@ fun FullAppWebView(
                         }
 
                         override fun onPermissionRequest(request: android.webkit.PermissionRequest?) {
+                            if (request == null) return
+                            val wantsAudio = request.resources?.any {
+                                it == android.webkit.PermissionRequest.RESOURCE_AUDIO_CAPTURE
+                            } == true
                             activity.runOnUiThread {
-                                activity.requestAudioPermissionInternal()
-                            }
-                            try {
-                                request?.grant(request.resources)
-                            } catch (e: Exception) {
-                                android.util.Log.w("SamiWebView", "Permission grant failed: ${e.message}")
+                                if (wantsAudio) {
+                                    activity.requestAudioPermissionInternal(request)
+                                } else {
+                                    try {
+                                        request.grant(request.resources)
+                                    } catch (_: Exception) {}
+                                }
                             }
                         }
 

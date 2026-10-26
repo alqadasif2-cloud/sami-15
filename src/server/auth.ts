@@ -124,9 +124,10 @@ export async function authenticateToken(req: Request, res: Response, next: NextF
     }
   }
 
-  // Also support x-sami-session header (URL-encoded or raw JSON) or _ownerSession body fallback, strictly verified against DB
+  // Also support x-sami-session header (URL-encoded or raw JSON), ?session= query param, or _ownerSession body fallback
   const rawSessionInput =
     req.headers['x-sami-session'] ||
+    (req.query && req.query.session ? String(req.query.session) : undefined) ||
     (req.body && typeof req.body === 'object' ? req.body._ownerSession : undefined);
 
   if (rawSessionInput) {
@@ -140,8 +141,52 @@ export async function authenticateToken(req: Request, res: Response, next: NextF
         parsed = JSON.parse(decoded);
       }
       if (parsed && parsed.id) {
-        const { getUserById } = await import('./db.ts');
-        const dbUser = await getUserById(Number(parsed.id));
+        const numericId = Number(parsed.id);
+        const isGuestAccount =
+          parsed.isGuest === true ||
+          parsed.role === 'guest' ||
+          numericId > 9000000 ||
+          String(parsed.username || '').startsWith('guest_');
+
+        if (isGuestAccount && numericId > 0) {
+          req.user = {
+            id: numericId,
+            username: String(parsed.username || `guest_${numericId}`),
+            displayName: String(parsed.displayName || 'ضيف'),
+            role: 'guest', // strictly locked to guest - zero privilege escalation
+            avatarUrl: null,
+            isGuest: true,
+          };
+          return next();
+        }
+
+        const { getUserById, projectId, databaseId } = await import('./db.ts');
+        let dbUser = await getUserById(numericId);
+        if (!dbUser && numericId > 0) {
+          try {
+            const url = `https://firestore.googleapis.com/v1/projects/${projectId}/databases/${databaseId}/documents/community_users/${encodeURIComponent(String(numericId))}`;
+            const resp = await fetch(url);
+            if (resp.ok) {
+              const docJson: any = await resp.json();
+              const f = docJson?.fields;
+              if (f) {
+                const uname = f.username?.stringValue || '';
+                const rawRole = f.role?.stringValue || 'user';
+                dbUser = {
+                  id: numericId,
+                  username: uname,
+                  displayName: f.displayName?.stringValue || uname || 'متداول',
+                  passwordHash: '',
+                  salt: '',
+                  role: numericId === 1 ? 'owner' : rawRole === 'moderator' ? 'moderator' : 'user',
+                  avatarUrl: f.avatarUrl?.stringValue || null,
+                  createdAt: Date.now(),
+                  updatedAt: Date.now(),
+                };
+              }
+            }
+          } catch {}
+        }
         if (dbUser && dbUser.username.toLowerCase() === String(parsed.username || '').toLowerCase()) {
           req.user = {
             id: dbUser.id,

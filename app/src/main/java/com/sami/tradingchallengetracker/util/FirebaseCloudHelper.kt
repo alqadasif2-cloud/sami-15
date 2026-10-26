@@ -33,37 +33,108 @@ object FirebaseCloudHelper {
     @Volatile
     private var storageInstance: FirebaseStorage? = null
 
+    private const val SHARED_FIRESTORE_DB_ID = "ai-studio-c1d1b606-9578-42a6-b7b2-17faaec47f72"
+    private const val FCM_PREFS = "sami_fcm_prefs"
+    private const val KEY_STABLE_DEVICE_ID = "key_stable_device_id"
+
+    fun getStableDeviceId(context: Context): String {
+        val prefs = context.getSharedPreferences(FCM_PREFS, Context.MODE_PRIVATE)
+        val existing = prefs.getString(KEY_STABLE_DEVICE_ID, null)
+        if (!existing.isNullOrBlank()) return existing
+        val generated = "dev_android_${UUID.randomUUID().toString().replace("-", "").take(16)}"
+        prefs.edit().putString(KEY_STABLE_DEVICE_ID, generated).apply()
+        return generated
+    }
+
     fun getFirestore(context: Context): FirebaseFirestore {
         return firestoreInstance ?: synchronized(this) {
             firestoreInstance ?: run {
-                if (FirebaseApp.getApps(context).isEmpty()) {
-                    try {
+                val app = try {
+                    if (FirebaseApp.getApps(context).isEmpty()) {
                         FirebaseApp.initializeApp(context)
-                    } catch (_: Exception) {
-                        try {
-                            val options = com.google.firebase.FirebaseOptions.Builder()
-                                .setProjectId("majestic-interface-ksmzh")
-                                .setApplicationId("com.sami.tradingchallengetracker")
-                                .setApiKey("AIzaSyB-fakeKeyPlaceholderForInit")
-                                .setStorageBucket("majestic-interface-ksmzh-media")
-                                .build()
-                            FirebaseApp.initializeApp(context, options)
-                        } catch (_: Exception) {}
+                    } else {
+                        FirebaseApp.getInstance()
                     }
+                } catch (_: Exception) {
+                    null
                 }
-                val db = FirebaseFirestore.getInstance()
-                val settings = FirebaseFirestoreSettings.Builder()
-                    .setLocalCacheSettings(
-                        PersistentCacheSettings.newBuilder()
-                            .setSizeBytes(100L * 1024 * 1024) // 100MB offline local cache
-                            .build()
-                    )
-                    .build()
-                db.firestoreSettings = settings
+
+                val db = try {
+                    if (app != null) {
+                        FirebaseFirestore.getInstance(app, SHARED_FIRESTORE_DB_ID)
+                    } else {
+                        FirebaseFirestore.getInstance(SHARED_FIRESTORE_DB_ID)
+                    }
+                } catch (_: Exception) {
+                    FirebaseFirestore.getInstance()
+                }
+
+                try {
+                    val settings = FirebaseFirestoreSettings.Builder()
+                        .setLocalCacheSettings(
+                            PersistentCacheSettings.newBuilder()
+                                .setSizeBytes(100L * 1024 * 1024) // 100MB offline local cache
+                                .build()
+                        )
+                        .build()
+                    db.firestoreSettings = settings
+                } catch (_: Exception) {}
+
                 firestoreInstance = db
                 db
             }
         }
+    }
+
+    suspend fun syncDeviceFcmToken(
+        context: Context,
+        token: String,
+        userId: Int,
+        username: String
+    ) = withContext(Dispatchers.IO) {
+        val cleanToken = token.trim()
+        if (cleanToken.isEmpty() || userId <= 0) return@withContext
+        try {
+            val db = getFirestore(context)
+            val devId = getStableDeviceId(context)
+            val docId = "token_${userId}_${devId}"
+            val now = System.currentTimeMillis()
+
+            // Remove any stale token document on this same physical device from a previous user account
+            val prefs = context.getSharedPreferences(FCM_PREFS, Context.MODE_PRIVATE)
+            val lastBoundUserId = prefs.getInt("key_last_bound_uid", 0)
+            if (lastBoundUserId > 0 && lastBoundUserId != userId) {
+                try {
+                    db.collection("user_fcm_tokens").document("token_${lastBoundUserId}_${devId}").delete().await()
+                } catch (_: Exception) {}
+            }
+            prefs.edit().putInt("key_last_bound_uid", userId).apply()
+
+            val payload = hashMapOf<String, Any>(
+                "id" to docId,
+                "token" to cleanToken,
+                "userId" to userId,
+                "username" to username,
+                "deviceId" to devId,
+                "platform" to "android",
+                "deviceModel" to "${Build.MANUFACTURER} ${Build.MODEL}".trim(),
+                "updatedAt" to now,
+                "createdAt" to now
+            )
+
+            db.collection("user_fcm_tokens").document(docId).set(payload).await()
+        } catch (e: Exception) {
+            android.util.Log.w("SamiFCM", "Error syncing FCM token to shared Firestore: ${e.message}")
+        }
+    }
+
+    suspend fun removeDeviceFcmToken(context: Context, userId: Int) = withContext(Dispatchers.IO) {
+        if (userId <= 0) return@withContext
+        try {
+            val db = getFirestore(context)
+            val devId = getStableDeviceId(context)
+            db.collection("user_fcm_tokens").document("token_${userId}_${devId}").delete().await()
+        } catch (_: Exception) {}
     }
 
     fun getStorage(context: Context): FirebaseStorage {

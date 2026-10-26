@@ -19,6 +19,8 @@ import {
   databaseId,
   saveChannelRecord,
   updateChannelMembers,
+  isChannelOpenPublic,
+  joinChannelWithAccessCheck,
   getUserConversationsList,
   getPrivateMessagesList,
   savePrivateMessageRecord,
@@ -30,7 +32,12 @@ import {
 } from './db.ts';
 import { authenticateToken, requireAuth, requireRole, generateToken, verifyToken } from './auth.ts';
 import { saveFile, getFile } from './storage.ts';
-import { registerDeviceToken, unregisterDeviceToken, sendNotificationToUsers } from './fcm.ts';
+import {
+  registerDeviceToken,
+  unregisterDeviceToken,
+  sendNotificationToUsers,
+  dispatchAuthorizedChatPush,
+} from './fcm.ts';
 
 export const apiRouter = Router();
 
@@ -310,7 +317,7 @@ apiRouter.get('/channels/:id', requireAuth, async (req, res) => {
 
 apiRouter.post('/channels', requireAuth, requireRole('owner'), async (req, res) => {
   try {
-    const { id, name, description, visibility, isPrivate, allowedMemberIds, displayMemberCount } = req.body;
+    const { id, name, description, visibility, isPrivate, isOpenPublic, password, allowedMemberIds, memberIds, displayMemberCount } = req.body;
     if (!name) {
       return res.status(400).json({ error: 'اسم القناة مطلوب' });
     }
@@ -321,15 +328,28 @@ apiRouter.post('/channels', requireAuth, requireRole('owner'), async (req, res) 
       if (!isNaN(parsed) && parsed >= 0) parsedCount = parsed;
     }
 
+    const isHidden = visibility === 'hidden';
+    const cleanPassword = !isHidden && isOpenPublic ? '' : String(password || '').trim();
+    const openPublicFlag = !isHidden && (isOpenPublic === true || (!isPrivate && !cleanPassword && isOpenPublic !== false));
+    const seedMembers = Array.isArray(memberIds)
+      ? memberIds
+      : Array.isArray(allowedMemberIds)
+        ? allowedMemberIds
+        : [];
+    const normalizedMembers = Array.from(new Set([1, req.user!.id, ...seedMembers.map(Number).filter((n) => n > 0)]));
+
     const newChan = {
       id: channelId,
       name: String(name).trim(),
       description: String(description || '').trim(),
-      isPrivate: !!isPrivate || visibility === 'hidden',
-      visibility: visibility === 'hidden' ? ('hidden' as const) : ('public' as const),
-      allowedMemberIds: Array.isArray(allowedMemberIds) ? Array.from(new Set([...allowedMemberIds, req.user!.id])) : [req.user!.id],
-      memberIds: Array.isArray(allowedMemberIds) ? Array.from(new Set([...allowedMemberIds, req.user!.id])) : [req.user!.id],
+      password: cleanPassword,
+      isOpenPublic: openPublicFlag,
+      isPrivate: isHidden || (!openPublicFlag && (Boolean(isPrivate) || cleanPassword.length > 0)),
+      visibility: isHidden ? ('hidden' as const) : ('public' as const),
+      allowedMemberIds: normalizedMembers,
+      memberIds: normalizedMembers,
       createdAt: Date.now(),
+      updatedAt: Date.now(),
       displayMemberCount: parsedCount,
     };
     await saveChannelRecord(newChan);
@@ -341,15 +361,43 @@ apiRouter.post('/channels', requireAuth, requireRole('owner'), async (req, res) 
 
 apiRouter.put('/channels/:id', requireAuth, requireRole('owner'), async (req, res) => {
   try {
-    const channel = await getChannelById(req.params.id);
+    let channel = await getChannelById(req.params.id);
     if (!channel) {
-      return res.status(404).json({ error: 'القناة غير موجودة' });
+      // Create mirror record if channel existed only in client Firestore previously
+      channel = {
+        id: req.params.id,
+        name: String(req.body.name || 'قناة تداول').trim(),
+        description: String(req.body.description || '').trim(),
+        isPrivate: false,
+        visibility: 'public',
+        allowedMemberIds: [1],
+        memberIds: [1],
+        createdAt: Date.now(),
+      };
     }
-    const { name, description, visibility, isPrivate, allowedMemberIds, displayMemberCount } = req.body;
+    const { name, description, visibility, isPrivate, isOpenPublic, password, allowedMemberIds, memberIds, displayMemberCount } = req.body;
     if (name) channel.name = String(name).trim();
     if (description !== undefined) channel.description = String(description).trim();
     if (visibility) channel.visibility = visibility === 'hidden' ? 'hidden' : 'public';
-    if (isPrivate !== undefined) channel.isPrivate = !!isPrivate;
+
+    if (channel.visibility === 'hidden') {
+      channel.isOpenPublic = false;
+      channel.isPrivate = true;
+      if (password !== undefined) channel.password = String(password).trim();
+    } else if (isOpenPublic !== undefined) {
+      channel.isOpenPublic = Boolean(isOpenPublic);
+      if (channel.isOpenPublic) {
+        channel.password = '';
+        channel.isPrivate = false;
+      } else {
+        if (password !== undefined) channel.password = String(password).trim();
+        channel.isPrivate = isPrivate !== undefined ? Boolean(isPrivate) : Boolean(channel.password);
+      }
+    } else {
+      if (password !== undefined) channel.password = String(password).trim();
+      if (isPrivate !== undefined) channel.isPrivate = !!isPrivate;
+    }
+
     if (displayMemberCount !== undefined) {
       if (displayMemberCount === null || displayMemberCount === '') {
         channel.displayMemberCount = null;
@@ -358,14 +406,33 @@ apiRouter.put('/channels/:id', requireAuth, requireRole('owner'), async (req, re
         channel.displayMemberCount = !isNaN(parsed) && parsed >= 0 ? parsed : null;
       }
     }
-    if (Array.isArray(allowedMemberIds)) {
-      channel.allowedMemberIds = Array.from(new Set([...allowedMemberIds, 1]));
+    const incomingMembers = Array.isArray(memberIds) ? memberIds : Array.isArray(allowedMemberIds) ? allowedMemberIds : null;
+    if (incomingMembers) {
+      channel.allowedMemberIds = Array.from(new Set([1, ...incomingMembers.map(Number).filter((n) => n > 0)]));
       channel.memberIds = channel.allowedMemberIds;
     }
+    channel.updatedAt = Date.now();
     await saveChannelRecord(channel);
     res.json({ success: true, channel });
   } catch (err: any) {
     res.status(500).json({ error: 'فشل تحديث القناة: ' + (err?.message || err) });
+  }
+});
+
+apiRouter.post('/channels/:id/join', requireAuth, async (req, res) => {
+  try {
+    const user = req.user!;
+    const password = typeof req.body?.password === 'string' ? req.body.password : undefined;
+    const { channel } = await joinChannelWithAccessCheck({
+      channelId: req.params.id,
+      userId: user.id,
+      userRole: user.role,
+      isGuest: user.isGuest,
+      password,
+    });
+    res.json({ success: true, channel });
+  } catch (err: any) {
+    res.status(403).json({ error: err?.message || 'تعذر الانضمام إلى القناة' });
   }
 });
 
@@ -398,7 +465,11 @@ apiRouter.get('/channels/:id/messages', requireAuth, async (req, res) => {
     return res.status(404).json({ error: 'القناة غير موجودة' });
   }
 
-  if (channel.visibility === 'hidden' && user.role !== 'owner') {
+  const openPublic = isChannelOpenPublic(channel);
+  if (!openPublic && user.role !== 'owner') {
+    if (user.isGuest || user.role === 'guest') {
+      return res.status(403).json({ error: 'هذه القناة متاحة للأعضاء المصرح لهم فقط' });
+    }
     const isAllowed = channel.allowedMemberIds?.includes(user.id) || channel.memberIds?.includes(user.id);
     if (!isAllowed) {
       return res.status(403).json({ error: 'غير مصرح لك بعرض رسائل هذه القناة' });
@@ -420,7 +491,11 @@ apiRouter.post('/channels/:id/messages', requireAuth, async (req, res) => {
       return res.status(404).json({ error: 'القناة غير موجودة' });
     }
 
-    if (channel.visibility === 'hidden' && user.role !== 'owner') {
+    const openPublic = isChannelOpenPublic(channel);
+    if (!openPublic && user.role !== 'owner') {
+      if (user.isGuest || user.role === 'guest') {
+        return res.status(403).json({ error: 'غير مصرح للضيوف بالإرسال في القنوات المحمية أو الخاصة' });
+      }
       const isAllowed = channel.allowedMemberIds?.includes(user.id) || channel.memberIds?.includes(user.id);
       if (!isAllowed) {
         return res.status(403).json({ error: 'غير مصرح لك بالإرسال في هذه القناة' });
@@ -435,13 +510,15 @@ apiRouter.post('/channels/:id/messages', requireAuth, async (req, res) => {
 
     const now = Date.now();
     const messageId = `msg_${now}_${user.id}_${Math.random().toString(36).substring(2, 7)}`;
+    // Ensure guests never acquire elevated roles
+    const safeRole = user.isGuest || user.role === 'guest' ? 'guest' : user.role;
 
     const newMsg = {
       id: messageId,
       channelId,
       senderId: user.id,
       senderName: user.displayName,
-      senderRole: user.role,
+      senderRole: safeRole,
       senderAvatarUrl: user.avatarUrl || null,
       text: text ? String(text).trim() : undefined,
       fileUrl: fileUrl || undefined,
@@ -449,7 +526,7 @@ apiRouter.post('/channels/:id/messages', requireAuth, async (req, res) => {
       fileSize: fileSize || undefined,
       fileType: fileType || undefined,
       audioUrl: audioUrl || undefined,
-      audioDuration: audioDuration || undefined,
+      audioDuration: audioDuration ? Number(audioDuration) : undefined,
       replyToId: replyToId || null,
       isDeleted: false,
       timestamp: now,
@@ -457,30 +534,22 @@ apiRouter.post('/channels/:id/messages', requireAuth, async (req, res) => {
 
     await saveChannelMessage(newMsg);
 
-    // Push FCM Notification to eligible channel members
-    let recipients: number[] = [];
-    if (channel.visibility === 'hidden') {
-      recipients = channel.allowedMemberIds || [];
-    } else {
-      const allUsers = await getAllUsersList();
-      recipients = allUsers.map((u) => u.id);
-    }
     const snippet = text
       ? String(text).trim().slice(0, 100)
-      : fileName
-      ? `[مرفق ملف: ${fileName}]`
       : audioUrl
-      ? '[رسالة صوتية]'
-      : 'رسالة جديدة';
+        ? '🎤 رسالة صوتية'
+        : fileName
+          ? `📎 مرفق ملف: ${fileName}`
+          : 'رسالة جديدة';
 
-    sendNotificationToUsers(recipients, {
-      title: channel.name,
-      body: `${user.displayName}: ${snippet}`,
+    dispatchAuthorizedChatPush({
+      senderId: user.id,
+      senderName: user.displayName,
+      senderRole: safeRole,
       chatType: 'channel',
       channelId: channel.id,
       messageId: newMsg.id,
-      senderName: user.displayName,
-      senderId: user.id,
+      snippet,
     }).catch((e) => console.warn('[FCM] Notification dispatch notice:', e));
 
     res.json({ success: true, message: newMsg });
@@ -646,11 +715,38 @@ apiRouter.get('/files/:id', async (req, res) => {
       authUser = verifyToken(String(req.query.token)) || undefined;
     }
 
+    if (!authUser && req.query.session) {
+      try {
+        const raw = decodeURIComponent(String(req.query.session));
+        const parsed = JSON.parse(raw);
+        if (parsed?.id) {
+          if (parsed.isGuest || parsed.role === 'guest' || Number(parsed.id) > 9000000) {
+            authUser = {
+              id: Number(parsed.id),
+              username: String(parsed.username || `guest_${parsed.id}`),
+              displayName: String(parsed.displayName || 'ضيف'),
+              role: 'guest',
+              isGuest: true,
+            };
+          } else {
+            const dbU = await getUserById(Number(parsed.id));
+            if (dbU && dbU.username.toLowerCase() === String(parsed.username || '').toLowerCase()) {
+              authUser = {
+                id: dbU.id,
+                username: dbU.username,
+                displayName: dbU.displayName,
+                role: dbU.role,
+              };
+            }
+          }
+        }
+      } catch {}
+    }
+
     if (!authUser) {
       return res.status(401).json({ error: 'يجب تسجيل الدخول للوصول إلى هذا المرفق الخاص' });
     }
 
-    // Determine authorization:
     const isUploader = authUser.id === result.file.uploaderId;
     const isParticipant =
       (result.file.receiverId && authUser.id === result.file.receiverId) ||
@@ -661,8 +757,10 @@ apiRouter.get('/files/:id', async (req, res) => {
       const channel = await getChannelById(result.file.channelId);
       if (channel) {
         if (authUser.role === 'owner') hasChannelAccess = true;
-        else if (channel.visibility !== 'hidden' && !channel.isPrivate) hasChannelAccess = true;
-        else hasChannelAccess = !!(channel.allowedMemberIds?.includes(authUser.id) || channel.memberIds?.includes(authUser.id));
+        else if (isChannelOpenPublic(channel)) hasChannelAccess = true;
+        else if (!authUser.isGuest && authUser.role !== 'guest') {
+          hasChannelAccess = !!(channel.allowedMemberIds?.includes(authUser.id) || channel.memberIds?.includes(authUser.id));
+        }
       }
     }
 
@@ -672,10 +770,28 @@ apiRouter.get('/files/:id', async (req, res) => {
     }
   }
 
-  res.setHeader('Content-Type', result.file.fileType || 'application/octet-stream');
-  res.setHeader('Content-Length', result.buffer.length);
+  const totalLength = result.buffer.length;
+  const contentType = result.file.fileType || 'application/octet-stream';
+  res.setHeader('Content-Type', contentType);
+  res.setHeader('Accept-Ranges', 'bytes');
   res.setHeader('Content-Disposition', `inline; filename="${encodeURIComponent(result.file.fileName)}"`);
   res.setHeader('Cache-Control', 'private, max-age=3600');
+
+  const range = req.headers.range;
+  if (range) {
+    const parts = range.replace(/bytes=/, '').split('-');
+    const start = parseInt(parts[0], 10);
+    const end = parts[1] ? parseInt(parts[1], 10) : totalLength - 1;
+    if (!isNaN(start) && !isNaN(end) && start >= 0 && end < totalLength && start <= end) {
+      const chunkSize = end - start + 1;
+      res.status(206);
+      res.setHeader('Content-Range', `bytes ${start}-${end}/${totalLength}`);
+      res.setHeader('Content-Length', chunkSize);
+      return res.send(result.buffer.subarray(start, end + 1));
+    }
+  }
+
+  res.setHeader('Content-Length', totalLength);
   res.send(result.buffer);
 });
 
@@ -759,7 +875,7 @@ apiRouter.post('/private-messages', requireAuth, async (req, res) => {
     }
   }
 
-  const { text, imageUrl, storagePath, audioUrl, fileUrl, fileName } = req.body;
+  const { text, imageUrl, storagePath, audioUrl, audioDuration, fileUrl, fileName, fileSize, fileType } = req.body;
   if (!text && !imageUrl && !audioUrl && !fileUrl) {
     return res.status(400).json({ error: 'محتوى الرسالة مطلوب' });
   }
@@ -776,32 +892,34 @@ apiRouter.post('/private-messages', requireAuth, async (req, res) => {
     imageUrl: imageUrl || undefined,
     storagePath: storagePath || undefined,
     audioUrl: audioUrl || undefined,
+    audioDuration: audioDuration ? Number(audioDuration) : undefined,
     fileUrl: fileUrl || undefined,
     fileName: fileName || undefined,
+    fileSize: fileSize ? Number(fileSize) : undefined,
+    fileType: fileType || undefined,
     timestamp: now,
   };
 
   await savePrivateMessageRecord(newMsg);
 
-  // Dispatch FCM Push Notification to recipient
   const snippet = text
     ? String(text).trim().slice(0, 100)
-    : fileName
-    ? `[مرفق ملف: ${fileName}]`
     : audioUrl
-    ? '[رسالة صوتية]'
-    : imageUrl
-    ? '[صورة مرفقة]'
-    : 'رسالة خاصة جديدة';
+      ? '🎤 رسالة صوتية'
+      : fileName
+        ? `📎 مرفق ملف: ${fileName}`
+        : imageUrl
+          ? '📷 صورة مرفقة'
+          : 'رسالة خاصة جديدة';
 
-  sendNotificationToUsers([receiverId], {
-    title: `رسالة خاصة من ${req.user!.displayName}`,
-    body: snippet,
-    chatType: 'private',
-    partnerId: senderId,
-    messageId: newMsg.id,
-    senderName: req.user!.displayName,
+  dispatchAuthorizedChatPush({
     senderId,
+    senderName: req.user!.displayName,
+    senderRole: req.user!.role,
+    chatType: 'private',
+    receiverId,
+    messageId: newMsg.id,
+    snippet,
   }).catch((e) => console.warn('[FCM] Private message push notice:', e));
 
   res.json({ success: true, message: newMsg });
@@ -901,11 +1019,40 @@ apiRouter.post('/fcm/register', requireAuth, async (req, res) => {
 
 apiRouter.post('/fcm/unregister', requireAuth, async (req, res) => {
   try {
-    const { token } = req.body;
-    await unregisterDeviceToken(req.user!.id, token ? String(token) : undefined);
+    const { token, deviceId } = req.body;
+    await unregisterDeviceToken(
+      req.user!.id,
+      token ? String(token) : undefined,
+      deviceId ? String(deviceId) : undefined
+    );
     res.json({ success: true });
   } catch (err: any) {
     res.status(500).json({ error: 'فشل إلغاء تسجيل رمز الجهاز: ' + (err?.message || err) });
+  }
+});
+
+apiRouter.post('/fcm/dispatch', requireAuth, async (req, res) => {
+  try {
+    const user = req.user!;
+    const chatType = req.body.chatType === 'private' ? 'private' : 'channel';
+    const channelId = req.body.channelId ? String(req.body.channelId) : undefined;
+    const receiverId = req.body.receiverId ? Number(req.body.receiverId) : undefined;
+    const messageId = req.body.messageId ? String(req.body.messageId) : undefined;
+    const snippet = req.body.body ? String(req.body.body) : undefined;
+
+    const result = await dispatchAuthorizedChatPush({
+      senderId: user.id,
+      senderName: user.displayName,
+      senderRole: user.isGuest || user.role === 'guest' ? 'guest' : user.role,
+      chatType,
+      channelId,
+      receiverId,
+      messageId,
+      snippet,
+    });
+    res.json({ success: true, ...result });
+  } catch (err: any) {
+    res.status(500).json({ error: 'فشل إرسال الإشعار الخارجي: ' + (err?.message || err) });
   }
 });
 

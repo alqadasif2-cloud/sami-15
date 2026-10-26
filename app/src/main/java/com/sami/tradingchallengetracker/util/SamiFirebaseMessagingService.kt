@@ -1,19 +1,25 @@
 package com.sami.tradingchallengetracker.util
 
+import android.Manifest
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.graphics.Color
 import android.media.RingtoneManager
 import android.os.Build
 import androidx.core.app.NotificationCompat
 import androidx.core.app.NotificationManagerCompat
+import androidx.core.content.ContextCompat
 import com.google.firebase.messaging.FirebaseMessagingService
 import com.google.firebase.messaging.RemoteMessage
 import com.sami.tradingchallengetracker.MainActivity
 import com.sami.tradingchallengetracker.R
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
 
 class SamiFirebaseMessagingService : FirebaseMessagingService() {
 
@@ -22,6 +28,7 @@ class SamiFirebaseMessagingService : FirebaseMessagingService() {
         const val KEY_FCM_TOKEN = "key_fcm_token"
         const val KEY_CURRENT_USER_ID = "key_current_user_id"
         const val KEY_CURRENT_USERNAME = "key_current_username"
+        private const val KEY_RECENT_MSG_IDS = "key_recent_notified_msg_ids"
 
         const val CHANNEL_ID_PUBLIC = "sami_channel_messages"
         const val CHANNEL_ID_PRIVATE = "sami_private_messages"
@@ -87,21 +94,43 @@ class SamiFirebaseMessagingService : FirebaseMessagingService() {
             val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
             return prefs.getInt(KEY_CURRENT_USER_ID, 0)
         }
+
+        @Synchronized
+        private fun isDuplicateAndRecord(context: Context, messageId: String): Boolean {
+            if (messageId.isBlank()) return false
+            val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            val raw = prefs.getString(KEY_RECENT_MSG_IDS, "") ?: ""
+            val list = raw.split("|").filter { it.isNotBlank() }.toMutableList()
+            if (list.contains(messageId)) {
+                return true
+            }
+            list.add(messageId)
+            while (list.size > 60) {
+                list.removeAt(0)
+            }
+            prefs.edit().putString(KEY_RECENT_MSG_IDS, list.joinToString("|")).apply()
+            return false
+        }
     }
 
     override fun onNewToken(token: String) {
         super.onNewToken(token)
+        val cleanToken = token.trim()
+        if (cleanToken.isEmpty()) return
+
         val prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-        prefs.edit().putString(KEY_FCM_TOKEN, token).apply()
+        prefs.edit().putString(KEY_FCM_TOKEN, cleanToken).apply()
 
         val userId = getCurrentUserId(this)
         if (userId > 0) {
             val username = prefs.getString(KEY_CURRENT_USERNAME, "") ?: ""
-            // Sync to server / Firestore
-            val intent = Intent(this, MainActivity::class.java).apply {
-                putExtra("action", "sync_fcm_token")
-                putExtra("token", token)
-                flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP
+            CoroutineScope(Dispatchers.IO).launch {
+                FirebaseCloudHelper.syncDeviceFcmToken(
+                    context = applicationContext,
+                    token = cleanToken,
+                    userId = userId,
+                    username = username
+                )
             }
         }
     }
@@ -114,17 +143,30 @@ class SamiFirebaseMessagingService : FirebaseMessagingService() {
 
         val title = data["title"] ?: notification?.title ?: "رسالة جديدة - Sami"
         val body = data["body"] ?: notification?.body ?: "لديك إشعار جديد في تطبيق Sami"
-        val chatType = data["chatType"] ?: if (data.containsKey("partnerId")) "private" else "channel"
+        val chatType = data["chatType"] ?: if (!data["partnerId"].isNullOrBlank()) "private" else "channel"
         val channelId = data["channelId"] ?: ""
         val partnerId = data["partnerId"]?.toIntOrNull()
-        val messageId = data["messageId"] ?: ""
+        val senderId = data["senderId"]?.toIntOrNull()
+        val messageId = data["messageId"] ?: remoteMessage.messageId ?: ""
         val senderName = data["senderName"] ?: ""
 
-        // Multi-account privacy protection: Ensure notification recipient matches logged in session
-        val targetRecipientId = data["recipientId"]?.toIntOrNull()
+        // Strict account & privacy check:
+        // 1. Do not notify the sender of their own message
         val currentUserId = getCurrentUserId(this)
-        if (targetRecipientId != null && targetRecipientId > 0 && currentUserId > 0 && targetRecipientId != currentUserId) {
-            // Drop message intended for another account previously logged into this device
+        if (senderId != null && senderId > 0 && currentUserId > 0 && senderId == currentUserId) {
+            return
+        }
+
+        // 2. If message targets a specific recipient account, ensure that exact user is currently logged in
+        val targetRecipientId = data["recipientId"]?.toIntOrNull()
+        if (targetRecipientId != null && targetRecipientId > 0) {
+            if (currentUserId <= 0 || targetRecipientId != currentUserId) {
+                return
+            }
+        }
+
+        // 3. Deduplicate repeated push deliveries for the same messageId
+        if (messageId.isNotEmpty() && isDuplicateAndRecord(this, messageId)) {
             return
         }
 
@@ -148,10 +190,27 @@ class SamiFirebaseMessagingService : FirebaseMessagingService() {
         messageId: String,
         senderName: String
     ) {
+        // Ensure Android 8+ notification channels always exist even when woken in background
+        createNotificationChannels(this)
+
+        // Respect Android 13+ POST_NOTIFICATIONS runtime permission
+        if (Build.VERSION.SDK_INT >= 33) {
+            if (ContextCompat.checkSelfPermission(
+                    this,
+                    Manifest.permission.POST_NOTIFICATIONS
+                ) != PackageManager.PERMISSION_GRANTED
+            ) {
+                return
+            }
+        }
+
         val channelIdNotification = if (chatType == "private") CHANNEL_ID_PRIVATE else CHANNEL_ID_PUBLIC
+        val notificationId = if (messageId.isNotEmpty()) messageId.hashCode() else (System.currentTimeMillis() % 100000).toInt()
 
         val intent = Intent(this, MainActivity::class.java).apply {
-            flags = Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP
+            action = "OPEN_SAMI_CHAT_${notificationId}"
+            flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP
+            putExtra("fromNotification", true)
             putExtra("chatType", chatType)
             if (channelId.isNotEmpty()) putExtra("channelId", channelId)
             if (partnerId != null && partnerId > 0) {
@@ -164,7 +223,7 @@ class SamiFirebaseMessagingService : FirebaseMessagingService() {
 
         val pendingIntent = PendingIntent.getActivity(
             this,
-            (System.currentTimeMillis() % 100000).toInt(),
+            notificationId,
             intent,
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
@@ -178,18 +237,19 @@ class SamiFirebaseMessagingService : FirebaseMessagingService() {
             .setStyle(NotificationCompat.BigTextStyle().bigText(body))
             .setAutoCancel(true)
             .setSound(defaultSound)
-            .setColor(0xFFF59E0B.toInt()) // Amber brand color
+            .setColor(0xFFF59E0B.toInt())
             .setPriority(NotificationCompat.PRIORITY_HIGH)
+            .setCategory(NotificationCompat.CATEGORY_MESSAGE)
             .setVisibility(if (chatType == "private") NotificationCompat.VISIBILITY_PRIVATE else NotificationCompat.VISIBILITY_PUBLIC)
             .setContentIntent(pendingIntent)
 
-        val notificationId = if (messageId.isNotEmpty()) messageId.hashCode() else (System.currentTimeMillis() % 100000).toInt()
-
         try {
             val notificationManager = NotificationManagerCompat.from(this)
-            notificationManager.notify(notificationId, builder.build())
-        } catch (e: SecurityException) {
-            // Handled when POST_NOTIFICATIONS permission not granted
+            if (notificationManager.areNotificationsEnabled()) {
+                notificationManager.notify(messageId.ifEmpty { "sami_notif" }, notificationId, builder.build())
+            }
+        } catch (_: SecurityException) {
+            // Permission revoked at OS level
         }
     }
 }

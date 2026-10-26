@@ -370,11 +370,25 @@ export interface ChannelRecord {
   name: string;
   description: string;
   isPrivate: boolean;
-  visibility: 'public' | 'hidden';
+  isOpenPublic?: boolean;
+  password?: string;
+  imageUrl?: string | null;
+  storagePath?: string | null;
+  visibility: 'public' | 'visible' | 'hidden';
   allowedMemberIds: number[];
   memberIds: number[];
   createdAt: number;
+  updatedAt?: number;
   displayMemberCount?: number | null;
+}
+
+export function isChannelOpenPublic(channel: Partial<ChannelRecord> | null | undefined): boolean {
+  if (!channel) return false;
+  if (channel.visibility === 'hidden') return false;
+  if (channel.isOpenPublic === true) return true;
+  if (channel.isOpenPublic === false) return false;
+  const hasPassword = typeof channel.password === 'string' && channel.password.trim().length > 0;
+  return !channel.isPrivate && !hasPassword;
 }
 
 export const INITIAL_CHANNELS_CONFIG: ChannelRecord[] = [
@@ -439,12 +453,20 @@ export async function getChannelsForUser(userId: number, role: string): Promise<
       return channel.allowedMemberIds?.includes(userId) || channel.memberIds?.includes(userId);
     }
 
-    // Private channels require explicit membership
+    // Open public channels are visible to everyone including guests
+    if (isChannelOpenPublic(channel)) {
+      return true;
+    }
+
+    // Private channels require explicit membership (guests cannot access private/protected channels)
+    if (role === 'guest') {
+      return false;
+    }
     if (channel.isPrivate) {
       return channel.allowedMemberIds?.includes(userId) || channel.memberIds?.includes(userId);
     }
 
-    // Public channels visible to all
+    // Public channels visible to registered users
     return true;
   });
 }
@@ -456,9 +478,52 @@ export async function getChannelById(channelId: string): Promise<ChannelRecord |
       if (doc.exists) {
         return doc.data() as ChannelRecord;
       }
+      const commDoc = await firestoreClient.collection('community_channels').doc(channelId).get();
+      if (commDoc.exists) {
+        return commDoc.data() as ChannelRecord;
+      }
     } catch {}
   }
-  return diskStore.channels[channelId] || null;
+  if (diskStore.channels[channelId]) {
+    return diskStore.channels[channelId];
+  }
+  // Fallback: read from shared Firestore community_channels via REST
+  try {
+    const dbSeg = encodeURIComponent(databaseId || '(default)');
+    const url = `https://firestore.googleapis.com/v1/projects/${encodeURIComponent(projectId)}/databases/${dbSeg}/documents/community_channels/${encodeURIComponent(channelId)}`;
+    const res = await fetch(url, { method: 'GET', headers: { 'Cache-Control': 'no-cache' } });
+    if (res.ok) {
+      const json: any = await res.json();
+      const f = json?.fields;
+      if (f) {
+        const str = (v: any) => (v && 'stringValue' in v ? String(v.stringValue) : undefined);
+        const bool = (v: any) => (v && 'booleanValue' in v ? Boolean(v.booleanValue) : undefined);
+        const num = (v: any) => (v && 'integerValue' in v ? Number(v.integerValue) : v && 'doubleValue' in v ? Number(v.doubleValue) : undefined);
+        const arrNums = (v: any): number[] =>
+          Array.isArray(v?.arrayValue?.values)
+            ? v.arrayValue.values.map((x: any) => num(x)).filter((n: any): n is number => typeof n === 'number' && !isNaN(n))
+            : [];
+        const pwd = str(f.password) ?? '';
+        const vis = str(f.visibility) === 'hidden' ? 'hidden' : 'public';
+        const openPub = bool(f.isOpenPublic) ?? (vis !== 'hidden' && !pwd.trim() && bool(f.isPrivate) !== true);
+        return {
+          id: str(f.id) || channelId,
+          name: str(f.name) || 'قناة تداول',
+          description: str(f.description) || '',
+          password: pwd,
+          isOpenPublic: openPub,
+          isPrivate: !openPub && (bool(f.isPrivate) ?? Boolean(pwd.trim() || vis === 'hidden')),
+          visibility: vis,
+          allowedMemberIds: arrNums(f.allowedMemberIds),
+          memberIds: arrNums(f.memberIds),
+          createdAt: num(f.createdAt) || Date.now(),
+          updatedAt: num(f.updatedAt) || Date.now(),
+          displayMemberCount: num(f.displayMemberCount) ?? null,
+        };
+      }
+    }
+  } catch {}
+  return null;
 }
 
 export async function saveChannelRecord(channel: ChannelRecord): Promise<void> {
@@ -467,11 +532,65 @@ export async function saveChannelRecord(channel: ChannelRecord): Promise<void> {
 
   if (firestoreClient) {
     try {
-      await firestoreClient.collection('channels').doc(channel.id).set(channel);
+      await firestoreClient.collection('channels').doc(channel.id).set(channel, { merge: true });
+      await firestoreClient.collection('community_channels').doc(channel.id).set(channel, { merge: true });
     } catch (err: any) {
       console.warn('[Sami DB] Firestore save channel note:', err?.message);
     }
   }
+}
+
+export async function joinChannelWithAccessCheck(params: {
+  channelId: string;
+  userId: number;
+  userRole: string;
+  isGuest?: boolean;
+  password?: string;
+}): Promise<{ channel: ChannelRecord }> {
+  const { channelId, userId, userRole, isGuest, password } = params;
+  const channel = await getChannelById(channelId);
+  if (!channel) {
+    throw new Error('القناة غير موجودة');
+  }
+
+  if (channel.visibility === 'hidden' && userRole !== 'owner') {
+    const isAllowed = channel.allowedMemberIds?.includes(userId) || channel.memberIds?.includes(userId);
+    if (!isAllowed) {
+      throw new Error('هذه القناة مخفية ومخصصة للأعضاء المصرح لهم فقط');
+    }
+  }
+
+  const openPublic = isChannelOpenPublic(channel);
+  const guestAccount = Boolean(isGuest || userRole === 'guest' || userId > 9000000);
+
+  if (!openPublic && userRole !== 'owner') {
+    if (guestAccount) {
+      throw new Error('القنوات المحمية والخاصة متاحة للأعضاء المسجلين فقط');
+    }
+    if (channel.password && channel.password.trim().length > 0) {
+      if ((password || '').trim() !== channel.password.trim()) {
+        throw new Error('كلمة مرور القناة غير صحيحة');
+      }
+    } else if (channel.isPrivate) {
+      const isAllowed = channel.allowedMemberIds?.includes(userId) || channel.memberIds?.includes(userId);
+      if (!isAllowed) {
+        throw new Error('ليس لديك صلاحية للانضمام إلى هذه القناة الخاصة');
+      }
+    }
+  }
+
+  // Persist membership for registered users (guests get read/chat access with guest role without polluting admin lists)
+  if (!guestAccount && userId > 0) {
+    const updatedMembers = Array.from(new Set([1, ...(channel.memberIds || []), userId]));
+    channel.memberIds = updatedMembers;
+    if (!openPublic && Array.isArray(channel.allowedMemberIds)) {
+      channel.allowedMemberIds = Array.from(new Set([1, ...channel.allowedMemberIds, userId]));
+    }
+    channel.updatedAt = Date.now();
+    await saveChannelRecord(channel);
+  }
+
+  return { channel };
 }
 
 export async function updateChannelMembers(channelId: string, memberIds: number[]): Promise<ChannelRecord | null> {
@@ -687,12 +806,16 @@ export interface PrivateMessageRecord {
   receiverId: number;
   senderName: string;
   senderRole: string;
+  senderAvatarUrl?: string | null;
   text?: string;
   imageUrl?: string;
   storagePath?: string;
   audioUrl?: string;
+  audioDuration?: number;
   fileUrl?: string;
   fileName?: string;
+  fileSize?: number;
+  fileType?: string;
   timestamp: number;
 }
 
@@ -779,7 +902,7 @@ export async function getUserConversationsList(userId: number, userRole: string)
       partnerName: partnerUser?.displayName || (isGuest ? `ضيف رقم ${partnerId - 9000000}` : `مستخدم #${partnerId}`),
       partnerRole: partnerUser?.role || (isGuest ? 'guest' : 'user'),
       partnerAvatarUrl: partnerUser?.avatarUrl || null,
-      lastMessageText: lastMsg?.text || (lastMsg?.imageUrl ? '📷 صورة مرفقة' : (lastMsg?.fileName ? `📎 ملف: ${lastMsg.fileName}` : 'رسالة جديدة')),
+      lastMessageText: lastMsg?.text || (lastMsg?.audioUrl ? '🎤 رسالة صوتية' : (lastMsg?.imageUrl ? '📷 صورة مرفقة' : (lastMsg?.fileName ? `📎 ملف: ${lastMsg.fileName}` : 'رسالة جديدة'))),
       lastMessageTimestamp: lastMsg?.timestamp || Date.now(),
       isGuest,
     });
